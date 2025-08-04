@@ -1,36 +1,45 @@
-from flask import Flask, request, jsonify
-import requests, logging
-
-app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
-
-# ─── LIVE OANDA CREDENTIALS ────────────────────────────────────────────────
-OANDA_ACCOUNT_ID = "001-001-3116191-001"
-OANDA_API_KEY    = "56a54fc17014aaca9539155a433d01e3-c273c6e3707a45c8e2fb6ef24e5d4ec7"
-
-BASE_URL            = f"https://api-fxtrade.oanda.com/v3/accounts/{OANDA_ACCOUNT_ID}"
-ORDERS_URL          = f"{BASE_URL}/orders"
-POSITIONS_CLOSE_URL = f"{BASE_URL}/positions/{{instrument}}/close"
-
-HEADERS = {
-    "Authorization": f"Bearer {OANDA_API_KEY}",
-    "Content-Type":  "application/json"
-}
-
 @app.route("/", methods=["GET","POST"])
 def root():
     if request.method == "GET":
         return "✅ Webhook service is up", 200
 
-    data = request.get_json(force=True)
-    app.logger.info("Received alert: %s", data)
-
+    data       = request.get_json(force=True)
     action     = data.get("action")
     instrument = data.get("instrument")
-    units      = data.get("units")
+    units      = int(data.get("units"))
+
+    app.logger.info("Received alert: %s", data)
 
     try:
         if action == "market_order":
+            # 1) Fetch current position for this instrument
+            pos_resp = requests.get(
+                f"{BASE_URL}/positions/{instrument}",
+                headers=HEADERS
+            ).json()["position"]
+
+            long_u  = float(pos_resp["long"]["units"])
+            short_u = float(pos_resp["short"]["units"])
+
+            # 2) If we're about to BUY but have a short open, close it first
+            if units > 0 and short_u != 0:
+                close_sh = {"shortUnits": "ALL"}
+                r1 = requests.put(
+                    f"{BASE_URL}/positions/{instrument}/close",
+                    headers=HEADERS, json=close_sh
+                )
+                app.logger.info("Auto-closed short: %s", r1.text)
+
+            # 3) If we're about to SELL but have a long open, close it first
+            if units < 0 and long_u != 0:
+                close_lg = {"longUnits": "ALL"}
+                r2 = requests.put(
+                    f"{BASE_URL}/positions/{instrument}/close",
+                    headers=HEADERS, json=close_lg
+                )
+                app.logger.info("Auto-closed long: %s", r2.text)
+
+            # 4) Now place the new market order
             payload = {
                 "order": {
                     "instrument":   instrument,
@@ -44,18 +53,18 @@ def root():
             app.logger.info("Order response: %s", resp.text)
             return jsonify(resp.json()), resp.status_code
 
-        if action == "close_all":
-            url  = POSITIONS_CLOSE_URL.format(instrument=instrument)
+        elif action == "close_all":
             body = {"longUnits":"ALL","shortUnits":"ALL"}
-            resp = requests.put(url, headers=HEADERS, json=body)
-            app.logger.info("Close response: %s", resp.text)
+            resp = requests.put(
+                POSITIONS_CLOSE_URL.format(instrument=instrument),
+                headers=HEADERS, json=body
+            )
+            app.logger.info("Close-all response: %s", resp.text)
             return jsonify(resp.json()), resp.status_code
 
-        return jsonify({"error": f"Unknown action '{action}'"}), 400
+        else:
+            return jsonify({"error": f"Unknown action '{action}'"}), 400
 
     except Exception as e:
         app.logger.error("Exception: %s", e, exc_info=True)
         return jsonify({"error": str(e)}), 500
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
