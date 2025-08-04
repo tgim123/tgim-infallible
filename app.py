@@ -1,60 +1,61 @@
-# app.py
 from flask import Flask, request, jsonify
 import requests
+import os
 
 app = Flask(__name__)
 
-# ✅ LIVE OANDA CONFIG (NO PLACEHOLDERS)
-OANDA_ACCOUNT_ID = "001-001-5528021-001"
-OANDA_API_KEY   = "e6a7d8cac04118841ce0df0648160386-3c9cbdb8edeee1d64004daa4fd24277f"
-OANDA_API_URL   = f"https://api-fxtrade.oanda.com/v3/accounts/{OANDA_ACCOUNT_ID}/orders"
+# ✅ LIVE OANDA CONFIG (no placeholders)
+OANDA_ACCOUNT_ID = "001-001-3116191-001"
+OANDA_API_KEY    = "d5941ebf3f7d9d86640e5c174ec0e9b9-373d609200ea155798a5be3cde108b22"
+OANDA_API_URL    = "https://api-fxtrade.oanda.com"
 
 HEADERS = {
-    "Content-Type":  "application/json",
-    "Authorization": f"Bearer {OANDA_API_KEY}"
+    "Authorization": f"Bearer {OANDA_API_KEY}",
+    "Content-Type":  "application/json"
 }
 
-@app.route("/")
+@app.route("/", methods=["GET"])
 def index():
-    return "TGIM Auto Webhook is LIVE!"
+    return "TGIM Auto Webhook is LIVE"
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.get_json()
-    print("🔔 Incoming Alert:", data)
+    data = request.get_json(force=True)
+    print("📨 Incoming Alert:", data)
 
     action     = data.get("action")
     instrument = data.get("instrument")
-    units      = int(data.get("units", 0))
+    units      = data.get("units")
 
     if action == "market_order":
-        # buy vs sell
-        side = data.get("side", "buy")
-        factor = 1 if side == "buy" else -1
-
         payload = {
             "order": {
-                "instrument":    instrument,
-                "units":         str(units * factor),
-                "type":          "MARKET",
-                "positionFill": "DEFAULT"
+                "units":       str(units),
+                "instrument":  instrument,
+                "timeInForce": "FOK",
+                "type":        "MARKET",
+                "positionFill":"DEFAULT"
             }
         }
-
-        resp = requests.post(OANDA_API_URL, headers=HEADERS, json=payload)
-        print(f"➡️ Market Order [{resp.status_code}]: {resp.text}")
+        resp = requests.post(
+            f"{OANDA_API_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/orders",
+            headers=HEADERS,
+            json=payload
+        )
+        print("→ Market Order:", resp.status_code, resp.text)
         return jsonify(resp.json()), resp.status_code
 
     elif action == "close_all":
-        close_url = f"https://api-fxtrade.oanda.com/v3/accounts/{OANDA_ACCOUNT_ID}/positions/{instrument}/close"
-        payload   = {"longUnits":"ALL","shortUnits":"ALL"}
-
-        resp = requests.put(close_url, headers=HEADERS, json=payload)
-        print(f"✂️ Close Position [{resp.status_code}]: {resp.text}")
+        resp = requests.put(
+            f"{OANDA_API_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/positions/{instrument}/close",
+            headers=HEADERS
+        )
+        print("→ Close Position:", resp.status_code, resp.text)
         return jsonify(resp.json()), resp.status_code
 
     else:
-        return jsonify({"error":"Unknown action"}), 400
+        return jsonify({"error": f"Unknown action '{action}'"}), 400
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    port = int(os.getenv("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
