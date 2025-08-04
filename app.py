@@ -1,61 +1,74 @@
 from flask import Flask, request, jsonify
 import requests
-import os
 
 app = Flask(__name__)
 
 # ✅ LIVE OANDA CONFIG (no placeholders)
 OANDA_ACCOUNT_ID = "001-001-3116191-001"
-OANDA_API_KEY    = "d5941ebf3f7d9d86640e5c174ec0e9b9-373d609200ea155798a5be3cde108b22"
-OANDA_API_URL    = "https://api-fxtrade.oanda.com"
+OANDA_API_KEY   = "e6a7d8cac04118841ce0df0648160386-3c9cbdb8edeee1d64004daa4fd24277f"
+BASE_URL        = f"https://api-fxtrade.oanda.com/v3/accounts/{OANDA_ACCOUNT_ID}"
 
 HEADERS = {
-    "Authorization": f"Bearer {OANDA_API_KEY}",
-    "Content-Type":  "application/json"
+  "Content-Type":  "application/json",
+  "Authorization": f"Bearer {OANDA_API_KEY}"
 }
 
-@app.route("/", methods=["GET"])
-def index():
-    return "TGIM Auto Webhook is LIVE"
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.get_json(force=True)
-    print("📨 Incoming Alert:", data)
+    data       = request.get_json()
+    action     = data.get("action")       # "market_order" or "close_all"
+    instrument = data.get("instrument")   # e.g. "EUR_USD"
+    # note: for market_order alerts you're passing a positive integer for buys
+    #       and a positive integer for sells too (we’ll flip it below)
+    units      = int(data.get("units", 0))
 
-    action     = data.get("action")
-    instrument = data.get("instrument")
-    units      = data.get("units")
-
+    # ——————— MARKET ORDER (BUY or SELL) ———————
     if action == "market_order":
+        # determine sign: negative for sells
+        side = data.get("side", "").lower()
+        if side == "sell":
+            units = -abs(units)
+        else:
+            units = abs(units)
+
         payload = {
-            "order": {
-                "units":       str(units),
-                "instrument":  instrument,
-                "timeInForce": "FOK",
-                "type":        "MARKET",
-                "positionFill":"DEFAULT"
-            }
+          "order": {
+            "instrument":   instrument,
+            "units":        str(units),
+            "timeInForce":  "FOK",
+            "type":         "MARKET",
+            "positionFill": "DEFAULT"
+          }
         }
+
         resp = requests.post(
-            f"{OANDA_API_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/orders",
-            headers=HEADERS,
-            json=payload
+          f"{BASE_URL}/orders",
+          headers=HEADERS,
+          json=payload
         )
-        print("→ Market Order:", resp.status_code, resp.text)
+
+        app.logger.info("OANDA market_order response: %s", resp.text)
         return jsonify(resp.json()), resp.status_code
 
+
+    # ——————— CLOSE ALL POSITIONS FOR THIS INSTRUMENT ———————
     elif action == "close_all":
+        # OANDA: PUT /v3/accounts/{accountID}/positions/{instrument}/close
         resp = requests.put(
-            f"{OANDA_API_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/positions/{instrument}/close",
-            headers=HEADERS
+          f"{BASE_URL}/positions/{instrument}/close",
+          headers=HEADERS
         )
-        print("→ Close Position:", resp.status_code, resp.text)
+
+        app.logger.info("OANDA close_all response: %s", resp.text)
         return jsonify(resp.json()), resp.status_code
 
+
+    # ——————— IGNORE EVERYTHING ELSE ———————
     else:
-        return jsonify({"error": f"Unknown action '{action}'"}), 400
+        return jsonify({"ignored": True}), 200
+
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    # Render binds to $PORT automatically, but locally we’ll use 10000
+    app.run(port=10000)
