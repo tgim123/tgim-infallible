@@ -6,8 +6,10 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
 # ─── LIVE OANDA CREDENTIALS ────────────────────────────────────────────────
-OANDA_ACCOUNT_ID = "001-001-3116191-001"
-OANDA_API_KEY    = "d5941ebf3f7d9d86640e5c174ec0e9b9-373d609200ea155798a5be3cde108b22"
+import os
+
+OANDA_ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID")
+OANDA_API_KEY    = os.environ.get("OANDA_API_KEY")
 
 BASE_URL          = f"https://api-fxtrade.oanda.com/v3/accounts/{OANDA_ACCOUNT_ID}"
 ORDERS_URL        = f"{BASE_URL}/orders"
