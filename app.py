@@ -1,48 +1,71 @@
 from flask import Flask, request, jsonify
-import os
 import requests
-from dotenv import load_dotenv
-
-load_dotenv()
 
 app = Flask(__name__)
 
-OANDA_API_KEY = os.getenv("OANDA_API_KEY")
-OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID")
+# Fully hardcoded OANDA credentials and URLs
+OANDA_API_KEY = "e6a7d8cac04118841ce0df0648160386-3c9cbdb8edeee1d64004daa4fd24277f"
+OANDA_ACCOUNT_ID = "001-001-5528021-001"
 
-@app.route('/webhook', methods=['POST'])
+HEADERS = {
+    "Authorization": "Bearer e6a7d8cac04118841ce0df0648160386-3c9cbdb8edeee1d64004daa4fd24277f",
+    "Content-Type": "application/json"
+}
+
+@app.route("/")
+def index():
+    return "TGIM Auto Webhook is LIVE!"
+
+@app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.json
-    action = data.get("action")
-    instrument = data.get("instrument", {})
-    units = data.get("units", 0)
+    data = request.get_json()
 
-    headers = {
-        "Authorization": f"Bearer {OANDA_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    try:
+        action = data.get("action")
+        side = data.get("side")
+        instrument = data.get("instrument")
+        units = str(data.get("units"))
 
-    if action == "market_order":
-        payload = {
-            "order": {
-                "units": str(units) if data.get("side") == "buy" else f"-{units}",
-                "instrument": instrument.get("symbol"),
-                "timeInForce": "FOK",
-                "type": "MARKET",
-                "positionFill": "DEFAULT"
+        if not all([action, side, instrument, units]):
+            return jsonify({"error": "Missing required fields"}), 400
+
+        if action == "market_order":
+            order_data = {
+                "order": {
+                    "units": units if side == "buy" else f"-{units}",
+                    "instrument": instrument,
+                    "timeInForce": "FOK",
+                    "type": "MARKET",
+                    "positionFill": "DEFAULT"
+                }
             }
-        }
-        r = requests.post(
-            f"https://api-fxpractice.oanda.com/v3/accounts/{OANDA_ACCOUNT_ID}/orders",
-            headers=headers, json=payload)
-        return jsonify(r.json())
 
-    elif action == "close_all":
-        symbol = instrument.get("symbol")
-        r = requests.put(
-            f"https://api-fxpractice.oanda.com/v3/accounts/{OANDA_ACCOUNT_ID}/positions/{symbol}/close",
-            headers=headers,
-            json={"longUnits": "ALL", "shortUnits": "ALL"})
-        return jsonify(r.json())
+            url = "https://api-fxpractice.oanda.com/v3/accounts/001-001-5528021-001/orders"
+            response = requests.post(url, headers=HEADERS, json=order_data)
 
-    return jsonify({"status": "invalid action"}), 400
+            if response.status_code == 201:
+                return jsonify({"status": "success", "details": response.json()})
+            else:
+                return jsonify({"error": "order failed", "details": response.text}), response.status_code
+
+        elif action == "close_all":
+            url = f"https://api-fxpractice.oanda.com/v3/accounts/001-001-5528021-001/positions/{instrument}/close"
+            close_data = {
+                "longUnits" if side == "buy" else "shortUnits": "ALL"
+            }
+
+            response = requests.put(url, headers=HEADERS, json=close_data)
+
+            if response.status_code == 200:
+                return jsonify({"status": "position closed", "details": response.json()})
+            else:
+                return jsonify({"error": "close failed", "details": response.text}), response.status_code
+
+        else:
+            return jsonify({"error": "Invalid action"}), 400
+
+    except Exception as e:
+        return jsonify({"error": "Exception occurred", "details": str(e)}), 500
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)
