@@ -1,61 +1,46 @@
-from flask import Flask, request, jsonify, abort
-import os, requests
+# main.py
+from flask import Flask, request
+import os, requests, json
 
 app = Flask(__name__)
 
+// pull in your Render env-vars
 OANDA_ACCOUNT_ID = os.environ["OANDA_ACCOUNT_ID"]
-OANDA_API_KEY   = os.environ["OANDA_API_KEY"]
+OANDA_API_KEY    = os.environ["OANDA_API_KEY"]
+WEBHOOK_KEY      = os.environ["WEBHOOK_KEY"]  # optional: to lock down your endpoint
 
-BASE = f"https://api-fxtrade.oanda.com/v3/accounts/{OANDA_ACCOUNT_ID}"
-ORDERS_URL    = f"{BASE}/orders"
-POSITIONS_URL = f"{BASE}/positions/{{instrument}}/close"
-HEADERS = {
+OANDA_URL = f"https://api-fxpractice.oanda.com/v3/accounts/{OANDA_ACCOUNT_ID}/orders"
+HEADERS   = {
     "Authorization": f"Bearer {OANDA_API_KEY}",
     "Content-Type":  "application/json"
 }
 
-@app.route("/", methods=["POST","GET"])
-def root():
-    if request.method == "GET":
-        return "✅ OK", 200
+# if you want to require the webhook key in the path:
+@app.route(f"/tv-webhook/{WEBHOOK_KEY}", methods=["POST"])
+def tv_webhook():
+    data   = request.json
+    action = data["action"]       # "buy", "sell", etc.
+    units  = int(data["units"])
+    instr  = data["instrument"]
+    side   = "MARKET"
 
-    data = request.get_json(force=True)
-    action     = data["action"]
-    instrument = data["instrument"]
-    units      = int(data["units"])
+    # positive for buys/closes of shorts, negative for sells/closes of longs
+    sign =  1 if action in ["buy", "close_sell"] else -1
 
-    # BUY / SELL
-    if action in ("buy","sell"):
-        signed = units if action=="buy" else -units
-        payload = {
-          "order":{
-            "instrument": instrument,
-            "units":      str(signed),
-            "type":       "MARKET",
-            "timeInForce":"FOK",
-            "positionFill":"DEFAULT"
-          }
-        }
-        resp = requests.post(ORDERS_URL, headers=HEADERS, json=payload)
-        return jsonify(resp.json()), resp.status_code
+    order_body = {
+      "order": {
+        "instrument":    instr,
+        "units":         str(sign * units),
+        "type":          side,
+        "positionFill":  "DEFAULT"
+      }
+    }
 
-    # CLOSE LONG/SHORT/ALL:
-    if action=="close_buy":
-        resp = requests.put(POSITIONS_URL.format(instrument=instrument),
-                            headers=HEADERS, json={"longUnits":"ALL"})
-        return jsonify(resp.json()), resp.status_code
+    resp = requests.post(OANDA_URL,
+                         headers=HEADERS,
+                         json=order_body)
+    return (resp.text, resp.status_code)
 
-    if action=="close_sell":
-        resp = requests.put(POSITIONS_URL.format(instrument=instrument),
-                            headers=HEADERS, json={"shortUnits":"ALL"})
-        return jsonify(resp.json()), resp.status_code
-
-    if action=="close_all":
-        resp = requests.put(POSITIONS_URL.format(instrument=instrument),
-                            headers=HEADERS, json={"longUnits":"ALL","shortUnits":"ALL"})
-        return jsonify(resp.json()), resp.status_code
-
-    return jsonify({"error":f"Unknown action {action}"}), 400
-
-if __name__=="__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT",5000)))
+if __name__ == "__main__":
+    # in production you’ll run under Gunicorn, but this is fine locally
+    app.run(host="0.0.0.0", port=5000)
