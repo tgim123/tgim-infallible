@@ -6,28 +6,28 @@ app = Flask(__name__)
 # ─── OANDA SETTINGS ───────────────────────────────────────────────
 OANDA_ACCOUNT_ID = os.environ["OANDA_ACCOUNT_ID"]
 OANDA_API_KEY    = os.environ["OANDA_API_KEY"]
-
-# Live trading endpoint
-OANDA_URL = f"https://api-fxtrade.oanda.com/v3/accounts/{OANDA_ACCOUNT_ID}/orders"
-HEADERS   = {
+OANDA_URL        = f"https://api-fxtrade.oanda.com/v3/accounts/{OANDA_ACCOUNT_ID}/orders"
+HEADERS          = {
     "Authorization": f"Bearer {OANDA_API_KEY}",
     "Content-Type":  "application/json"
 }
 
-# ─── TradingView WEBHOOK ─────────────────────────────────────────
+# ─── HEALTH-CHECK (root) ──────────────────────────────────────────
+@app.route("/", methods=["GET", "HEAD"])
+def health_check():
+    return "OK", 200
+
+# ─── TRADINGVIEW WEBHOOK ─────────────────────────────────────────
 @app.route("/tv-webhook", methods=["POST"])
 def tv_webhook():
     data   = request.get_json(force=True)
-    action = data["action"]            # "buy", "sell", "close_buy", "close_sell"
-    units  = int(data.get("units", 1)) # default to 1 if missing
-    instr  = data["instrument"]        # e.g. "EUR_USD"
+    action = data["action"]             # "buy", "sell", "close_buy", "close_sell"
+    units  = int(data.get("units", 1))  # default 1 if missing
+    instr  = data["instrument"]         # e.g. "EUR_USD"
     side   = "MARKET"
 
-    # determine sign of units
-    if action in ["buy", "close_sell"]:
-        order_units = str(units)
-    else:
-        order_units = str(-units)
+    # sign the units
+    order_units = str(units) if action in ["buy", "close_sell"] else str(-units)
 
     order_body = {
         "order": {
@@ -43,6 +43,6 @@ def tv_webhook():
 
 
 if __name__ == "__main__":
-    # Default port 5000, override with PORT env-var if needed
+    # default port 5000, override via PORT env-var
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
