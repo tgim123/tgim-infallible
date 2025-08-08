@@ -1,44 +1,45 @@
-from flask import Flask, request, abort
-import os, requests
+from flask import Flask, request, jsonify
+import requests
+import os
 
 app = Flask(__name__)
 
-# environment‐pulled OANDA creds
+# Get environment variables
 OANDA_ACCOUNT_ID = os.environ["OANDA_ACCOUNT_ID"]
 OANDA_API_KEY    = os.environ["OANDA_API_KEY"]
-OANDA_URL        = f"https://api-fxtrade.oanda.com/v3/accounts/{OANDA_ACCOUNT_ID}/orders"
 
+# OANDA REST API URL (for live account, not practice)
+OANDA_URL = f"https://api-fxtrade.oanda.com/v3/accounts/{OANDA_ACCOUNT_ID}/orders"
 HEADERS = {
     "Authorization": f"Bearer {OANDA_API_KEY}",
     "Content-Type":  "application/json"
 }
 
 @app.route("/", methods=["POST"])
-def root():
-    # force JSON parse (415 if wrong media type)
-    data = request.get_json(force=True)
+def receive_order():
+    try:
+        data = request.get_json()
+        action     = data.get("action")
+        instrument = data.get("instrument")
+        units      = int(data.get("units"))
 
-    action     = data.get("action")
-    instrument = data.get("instrument")
-    units      = data.get("units")
-    if not all([action, instrument, units]):
-        abort(400, "Missing 'action', 'instrument', or 'units'")
+        if not action or not instrument or units == 0:
+            return jsonify({"error": "Invalid or missing fields"}), 400
 
-    # sign the units
-    sign = 1 if action.lower() in ("buy", "close_sell") else -1
-    order_units = str(int(units) * sign)
-
-    order_body = {
-        "order": {
-            "instrument":   instrument,
-            "units":        order_units,
-            "type":         "MARKET",
-            "positionFill": "DEFAULT"
+        order = {
+            "order": {
+                "instrument": instrument,
+                "units": str(units if action == "buy" else -units),
+                "type": "MARKET",
+                "positionFill": "DEFAULT"
+            }
         }
-    }
 
-    resp = requests.post(OANDA_URL, headers=HEADERS, json=order_body)
-    return (resp.text, resp.status_code)
+        response = requests.post(OANDA_URL, headers=HEADERS, json=order)
+        return jsonify(response.json()), response.status_code
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run(host="0.0.0.0", port=5000)
