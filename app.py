@@ -1,61 +1,54 @@
-from flask import Flask, request, jsonify
-import requests, logging
+# app.py
+
+from flask import Flask, request, abort
+import os, requests, json
 
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
 
-# ─── LIVE OANDA CREDENTIALS ────────────────────────────────────────────────
-OANDA_ACCOUNT_ID = "001-001-3116191-001"
-OANDA_API_KEY    = "56a54fc17014aaca9539155a433d01e3-c273c6e3707a45c8e2fb6ef24e5d4ec7"
+# Live OANDA credentials from environment
+OANDA_ACCOUNT_ID = os.environ["OANDA_ACCOUNT_ID"]
+OANDA_API_KEY    = os.environ["OANDA_API_KEY"]
 
-BASE_URL            = f"https://api-fxtrade.oanda.com/v3/accounts/{OANDA_ACCOUNT_ID}"
-ORDERS_URL          = f"{BASE_URL}/orders"
-POSITIONS_CLOSE_URL = f"{BASE_URL}/positions/{{instrument}}/close"
-
-HEADERS = {
+OANDA_URL = f"https://api-fxtrade.oanda.com/v3/accounts/{OANDA_ACCOUNT_ID}/orders"
+HEADERS   = {
     "Authorization": f"Bearer {OANDA_API_KEY}",
     "Content-Type":  "application/json"
 }
 
-@app.route("/", methods=["GET","POST"])
+# Only root endpoint—no /webhook, no mirror
+@app.route("/", methods=["POST"])
 def root():
-    if request.method == "GET":
-        return "✅ Webhook service is up", 200
+    if request.headers.get("Content-Type") != "application/json":
+        abort(400, "Expected JSON")
 
-    data = request.get_json(force=True)
-    app.logger.info("Received alert: %s", data)
-
+    data       = request.get_json()
     action     = data.get("action")
     instrument = data.get("instrument")
-    units      = data.get("units")
+    units      = int(data.get("units", 0))
 
-    try:
-        if action == "market_order":
-            payload = {
-                "order": {
-                    "instrument":   instrument,
-                    "units":        str(units),
-                    "type":         "MARKET",
-                    "timeInForce":  "FOK",
-                    "positionFill": "DEFAULT"
-                }
-            }
-            resp = requests.post(ORDERS_URL, headers=HEADERS, json=payload)
-            app.logger.info("Order response: %s", resp.text)
-            return jsonify(resp.json()), resp.status_code
+    if not all([action, instrument, units]):
+        abort(400, "Missing 'action', 'instrument', or 'units'")
 
-        if action == "close_all":
-            url  = POSITIONS_CLOSE_URL.format(instrument=instrument)
-            body = {"longUnits":"ALL","shortUnits":"ALL"}
-            resp = requests.put(url, headers=HEADERS, json=body)
-            app.logger.info("Close response: %s", resp.text)
-            return jsonify(resp.json()), resp.status_code
+    if action.lower() in ("buy", "close_sell"):
+        order_units = units
+    elif action.lower() in ("sell", "close_buy"):
+        order_units = -units
+    else:
+        abort(400, f"Unknown action '{action}'")
 
-        return jsonify({"error": f"Unknown action '{action}'"}), 400
+    payload = {
+        "order": {
+            "instrument":   instrument,
+            "units":        str(order_units),
+            "type":         "MARKET",
+            "positionFill": "DEFAULT"
+        }
+    }
 
-    except Exception as e:
-        app.logger.error("Exception: %s", e, exc_info=True)
-        return jsonify({"error": str(e)}), 500
+    resp = requests.post(OANDA_URL, headers=HEADERS, data=json.dumps(payload))
+    return (resp.text, resp.status_code)
+
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
