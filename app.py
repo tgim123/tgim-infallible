@@ -12,36 +12,36 @@ HEADERS          = {
     "Content-Type":  "application/json"
 }
 
-# ─── HEALTH-CHECK ─────────────────────────────────────────────────
-@app.route("/", methods=["GET", "HEAD"])
-def health_check():
-    return "OK", 200
+# ─── ROOT (health-check + webhook) ────────────────────────────────
+@app.route("/", methods=["GET", "HEAD", "POST"])
+def root():
+    if request.method in ("GET", "HEAD"):
+        return "OK", 200
 
-# ─── TRADINGVIEW WEBHOOK ───────────────────────────────────────────
-@app.route("/tv-webhook", methods=["POST"])
-def tv_webhook():
+    # POST from TradingView
     data   = request.get_json(force=True)
-    action = data["action"]             # e.g. "buy" / "sell" / "close_buy" / "close_sell"
-    units  = int(data.get("units", 1))  # default to 1
+    action = data["action"]             # "buy","sell","close_buy","close_sell"
+    units  = int(data.get("units", 1))  # default 1
     instr  = data["instrument"]         # e.g. "EUR_USD"
     side   = "MARKET"
 
-    # sign the units
-    order_units = str(units) if action in ["buy", "close_sell"] else str(-units)
+    # positive for buy/close_sell, negative for sell/close_buy
+    signed = units if action in ["buy", "close_sell"] else -units
 
-    order_body = {
+    order = {
         "order": {
             "instrument":   instr,
-            "units":        order_units,
+            "units":        str(signed),
             "type":         side,
             "positionFill": "DEFAULT"
         }
     }
 
-    resp = requests.post(OANDA_URL, headers=HEADERS, data=json.dumps(order_body))
+    resp = requests.post(OANDA_URL, headers=HEADERS, data=json.dumps(order))
     return resp.text, resp.status_code
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
