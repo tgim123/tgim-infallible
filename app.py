@@ -3,87 +3,48 @@ import os, requests, json
 
 app = Flask(__name__)
 
-# ───────────────────────────────
-# 🔐 REQUIRED ENV VARIABLES
-# ───────────────────────────────
+# OANDA ENV VARS — set in Render or .env
 OANDA_ACCOUNT_ID = os.environ["OANDA_ACCOUNT_ID"]
 OANDA_API_KEY    = os.environ["OANDA_API_KEY"]
 
-# 🔁 Change this to "api-fxpractice.oanda.com" for demo
-DOMAIN     = "api-fxtrade.oanda.com"
-BASE_URL   = f"https://{DOMAIN}/v3/accounts/{OANDA_ACCOUNT_ID}"
-ORDERS_URL = f"{BASE_URL}/orders"
-CLOSE_URL  = f"{BASE_URL}/positions/{{instrument}}/close"
+# Live trading endpoint — for real account
+OANDA_URL = f"https://api-fxtrade.oanda.com/v3/accounts/{OANDA_ACCOUNT_ID}/orders"
 
 HEADERS = {
     "Authorization": f"Bearer {OANDA_API_KEY}",
-    "Content-Type": "application/json"
+    "Content-Type":  "application/json"
 }
 
-# ───────────────────────────────
-# 🧠 CREATE ORDER PAYLOAD
-# ───────────────────────────────
-def create_order_payload(action, instrument, units):
-    side_multiplier = 1 if action in ["buy", "close_sell"] else -1
-    order = {
-        "order": {
-            "instrument": instrument,
-            "units": str(units * side_multiplier),
-            "type": "MARKET",
-            "positionFill": "DEFAULT"
-        }
-    }
-    return json.dumps(order)
+@app.route("/", methods=["GET"])
+def home():
+    return "✅ TGIM Webhook is live", 200
 
-# ───────────────────────────────
-# ❌ CLOSE POSITION
-# ───────────────────────────────
-def close_position(action, instrument):
-    payload = {
-        "longUnits":  "ALL" if action == "close_buy"  else "NONE",
-        "shortUnits": "ALL" if action == "close_sell" else "NONE"
-    }
-    url = CLOSE_URL.format(instrument=instrument)
-    return requests.put(url, headers=HEADERS, data=json.dumps(payload))
-
-# ───────────────────────────────
-# 🔥 ROOT WEBHOOK ENDPOINT "/"
-# ───────────────────────────────
-@app.route("/", methods=["POST"])
-def webhook_root():
+@app.route("/webhook", methods=["POST"])
+def webhook():
     try:
         data = request.json
-        action     = data.get("action")
-        instrument = data.get("instrument")
-        units      = int(data.get("units", 1))
+        action = data.get("action")
+        units_str = data.get("units", "1")
+        units = int(units_str) if units_str.isdigit() else 1
+        instr = "EUR_USD"  # Default/fallback if pair not provided
 
-        if not all([action, instrument, units]):
-            return jsonify({"error": "Missing parameters"}), 400
+        # BUY or SELL (positive = buy, negative = sell)
+        order_units = units if action in ["buy", "close_sell"] else -units
 
-        if action in ["buy", "sell"]:
-            payload = create_order_payload(action, instrument, units)
-            resp    = requests.post(ORDERS_URL, headers=HEADERS, data=payload)
-            return jsonify({"status": "order sent", "response": resp.json()}), resp.status_code
+        order_data = {
+            "order": {
+                "instrument": instr,
+                "units": str(order_units),
+                "type": "MARKET",
+                "positionFill": "DEFAULT"
+            }
+        }
 
-        elif action in ["close_buy", "close_sell"]:
-            resp = close_position(action, instrument)
-            return jsonify({"status": "position closed", "response": resp.json()}), resp.status_code
-
-        else:
-            return jsonify({"error": "Invalid action"}), 400
+        resp = requests.post(OANDA_URL, headers=HEADERS, data=json.dumps(order_data))
+        return jsonify({"status": "sent", "response": resp.json()}), resp.status_code
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": str(e)}), 400
 
-# ───────────────────────────────
-# ✅ HEALTH CHECK (GET /)
-# ───────────────────────────────
-@app.route("/", methods=["GET"])
-def health_check():
-    return "✅ OANDA Webhook Listener is Active", 200
-
-# ───────────────────────────────
-# 🚀 APP RUNNER
-# ───────────────────────────────
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(debug=True, port=5000)
