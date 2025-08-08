@@ -12,21 +12,21 @@ HEADERS          = {
     "Content-Type":  "application/json"
 }
 
-# ─── ROOT ENDPOINT (health-check + webhook) ───────────────────────
-@app.route("/", methods=["GET", "HEAD", "POST"])
-def root():
-    # Health‐check for GET/HEAD
-    if request.method in ("GET", "HEAD"):
-        return "OK", 200
+# ─── HEALTH-CHECK ─────────────────────────────────────────────────
+@app.route("/", methods=["GET", "HEAD"])
+def health_check():
+    return "OK", 200
 
-    # POST → TradingView webhook
+# ─── TRADINGVIEW WEBHOOK ───────────────────────────────────────────
+@app.route("/tv-webhook", methods=["POST"])
+def tv_webhook():
     data   = request.get_json(force=True)
-    action = data["action"]             # "buy", "sell", "close_buy", "close_sell"
-    units  = int(data.get("units", 1))  # default 1 if missing
+    action = data["action"]             # e.g. "buy" / "sell" / "close_buy" / "close_sell"
+    units  = int(data.get("units", 1))  # default to 1
     instr  = data["instrument"]         # e.g. "EUR_USD"
     side   = "MARKET"
 
-    # Determine signed units
+    # sign the units
     order_units = str(units) if action in ["buy", "close_sell"] else str(-units)
 
     order_body = {
