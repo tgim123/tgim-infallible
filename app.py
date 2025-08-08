@@ -5,6 +5,7 @@ import json
 
 app = Flask(__name__)
 
+# Load your OANDA credentials from environment
 OANDA_ACCOUNT_ID = os.environ["OANDA_ACCOUNT_ID"]
 OANDA_API_KEY    = os.environ["OANDA_API_KEY"]
 
@@ -17,16 +18,25 @@ HEADERS   = {
 @app.route("/", methods=["POST"])
 def tv_webhook():
     data   = request.json
-    action = data["action"]       # "buy", "sell", etc.
-    units  = int(data["units"])
-    instr  = data["instrument"]
-    side   = "MARKET"
+    print("Webhook payload:", data)  # for debugging in your Render logs
+
+    action = data.get("action", "").lower()    # e.g. "buy", "sell", "close_buy", "close_sell"
+    units  = int(data.get("units", 0))
+    instr  = data.get("instrument", "")
+
+    # Map actions to signed units:
+    #  - "buy" and "close_buy" → positive (open long or close short)
+    #  - "sell" and "close_sell" → negative (open short or close long)
+    if action in ["buy", "close_buy"]:
+        signed_units = units
+    else:
+        signed_units = -units
 
     order_body = {
         "order": {
-            "instrument": instr,
-            "units":  str(units if action in ["buy", "close_sell"] else -units),
-            "type":    side,
+            "instrument":   instr,
+            "units":        str(signed_units),
+            "type":         "MARKET",
             "positionFill": "DEFAULT"
         }
     }
