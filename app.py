@@ -1,11 +1,9 @@
-# app.py
-
 from flask import Flask, request, abort
 import os, requests, json
 
 app = Flask(__name__)
 
-# Pull in your live OANDA creds only
+# OANDA creds only
 OANDA_ACCOUNT_ID = os.environ["OANDA_ACCOUNT_ID"]
 OANDA_API_KEY    = os.environ["OANDA_API_KEY"]
 
@@ -15,7 +13,6 @@ HEADERS   = {
     "Content-Type":  "application/json"
 }
 
-# A single, simple endpoint — no secret key in the path
 @app.route("/webhook", methods=["POST"])
 def webhook():
     if request.headers.get("Content-Type") != "application/json":
@@ -24,11 +21,8 @@ def webhook():
     action     = data.get("action")
     units      = int(data.get("units", 0))
     instrument = data.get("instrument")
-
     if not all([action, instrument, units]):
-        abort(400, "Missing 'action', 'instrument' or 'units'")
-
-    # Determine signed units
+        abort(400, "Missing fields")
     if action.lower() in ("buy", "close_sell"):
         order_units = units
     elif action.lower() in ("sell", "close_buy"):
@@ -44,9 +38,13 @@ def webhook():
             "positionFill": "DEFAULT"
         }
     }
-
     resp = requests.post(OANDA_URL, headers=HEADERS, data=json.dumps(payload))
     return (resp.text, resp.status_code)
+
+# Workaround: mirror root POST to webhook
+@app.route("/", methods=["POST"])
+def root():
+    return webhook()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
