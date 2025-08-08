@@ -3,51 +3,45 @@ import os, requests, json
 
 app = Flask(__name__)
 
-# ENV variables (set in Render or your local .env)
+# OANDA credentials from environment
 OANDA_ACCOUNT_ID = os.environ["OANDA_ACCOUNT_ID"]
 OANDA_API_KEY    = os.environ["OANDA_API_KEY"]
 
-# LIVE endpoint (change to fxpractice.oanda.com for demo)
 OANDA_URL = f"https://api-fxtrade.oanda.com/v3/accounts/{OANDA_ACCOUNT_ID}/orders"
-
 HEADERS = {
     "Authorization": f"Bearer {OANDA_API_KEY}",
     "Content-Type":  "application/json"
 }
 
-# Health check route
-@app.route("/", methods=["GET"])
-def home():
-    return "✅ TGIM Webhook is LIVE", 200
+@app.route("/", methods=["GET", "POST"])  # ← FIXED TO MATCH YOUR WEBHOOK URL
+def root():
+    if request.method == "GET":
+        return "✅ TGIM Webhook is live", 200
 
-# Webhook POST — root path ONLY
-@app.route("/", methods=["POST"])
-def webhook():
     try:
-        data = request.json
+        data = request.get_json()
         action = data.get("action")
-        units  = int(data.get("units", 1))
+        units = int(data.get("units", 1))
+        instr = "EUR_USD"  # default pair
 
-        # Basic pair — change if needed
-        instrument = "EUR_USD"
+        order_units = units if action in ["buy", "close_sell"] else -units
 
-        # Determine direction
-        direction = units if action in ["buy", "close_sell"] else -units
-
-        order = {
+        order_data = {
             "order": {
-                "instrument": instrument,
-                "units": str(direction),
+                "instrument": instr,
+                "units": str(order_units),
                 "type": "MARKET",
                 "positionFill": "DEFAULT"
             }
         }
 
-        resp = requests.post(OANDA_URL, headers=HEADERS, data=json.dumps(order))
-        return jsonify({"status": "sent", "response": resp.json()}), resp.status_code
+        response = requests.post(OANDA_URL, headers=HEADERS, json=order_data)
+        return jsonify({"status": "sent", "response": response.json()}), response.status_code
 
     except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 400
+        return jsonify({"error": str(e)}), 400
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    import os
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
