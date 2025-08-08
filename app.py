@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-import os, requests, json
+import os, requests
 
 app = Flask(__name__)
 
@@ -13,20 +13,21 @@ HEADERS = {
     "Content-Type":  "application/json"
 }
 
-@app.route("/", methods=["GET", "POST"])  # ← FIXED TO MATCH YOUR WEBHOOK URL
-def root():
+# MAIN WEBHOOK ENDPOINT
+@app.route("/webhook", methods=["POST", "GET"])
+def webhook():
     if request.method == "GET":
         return "✅ TGIM Webhook is live", 200
 
     try:
         data = request.get_json()
         action = data.get("action")
-        units = int(data.get("units", 1))
-        instr = "EUR_USD"  # default pair
+        units  = int(data.get("units", 1))
+        instr  = data.get("instrument", "EUR_USD")  # default fallback
 
         order_units = units if action in ["buy", "close_sell"] else -units
 
-        order_data = {
+        order = {
             "order": {
                 "instrument": instr,
                 "units": str(order_units),
@@ -35,9 +36,11 @@ def root():
             }
         }
 
-        response = requests.post(OANDA_URL, headers=HEADERS, json=order_data)
-        return jsonify({"status": "sent", "response": response.json()}), response.status_code
+        resp = requests.post(OANDA_URL, headers=HEADERS, json=order)
+        try:
+            return jsonify({"status": "sent", "response": resp.json()}), resp.status_code
+        except:
+            return jsonify({"status": "sent", "raw": resp.text}), resp.status_code
 
     except Exception as e:
         return jsonify({"error": str(e)}), 400
-
