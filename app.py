@@ -1,38 +1,44 @@
-from flask import Flask, request, jsonify
-import requests
+from flask import Flask, request, abort
+import os, requests
 
 app = Flask(__name__)
 
-# OANDA API settings
-OANDA_ACCOUNT_ID = "YOUR_OANDA_ACCOUNT_ID"
-OANDA_API_KEY = "YOUR_OANDA_API_KEY"
-OANDA_URL = f"https://api-fxtrade.oanda.com/v3/accounts/{OANDA_ACCOUNT_ID}/orders"
+# environment‐pulled OANDA creds
+OANDA_ACCOUNT_ID = os.environ["OANDA_ACCOUNT_ID"]
+OANDA_API_KEY    = os.environ["OANDA_API_KEY"]
+OANDA_URL        = f"https://api-fxtrade.oanda.com/v3/accounts/{OANDA_ACCOUNT_ID}/orders"
 
 HEADERS = {
     "Authorization": f"Bearer {OANDA_API_KEY}",
-    "Content-Type": "application/json"
+    "Content-Type":  "application/json"
 }
 
 @app.route("/", methods=["POST"])
-def webhook():
-    data = request.json
-    action = data.get("action")
-    instrument = data.get("instrument")
-    units = data.get("units")
+def root():
+    # force JSON parse (415 if wrong media type)
+    data = request.get_json(force=True)
 
-    # Construct the OANDA order payload
-    order_data = {
+    action     = data.get("action")
+    instrument = data.get("instrument")
+    units      = data.get("units")
+    if not all([action, instrument, units]):
+        abort(400, "Missing 'action', 'instrument', or 'units'")
+
+    # sign the units
+    sign = 1 if action.lower() in ("buy", "close_sell") else -1
+    order_units = str(int(units) * sign)
+
+    order_body = {
         "order": {
-            "instrument": instrument,
-            "units": str(units) if action == "buy" else "-" + str(units),
-            "type": "MARKET",
+            "instrument":   instrument,
+            "units":        order_units,
+            "type":         "MARKET",
             "positionFill": "DEFAULT"
         }
     }
 
-    # Send the order to OANDA
-    response = requests.post(OANDA_URL, headers=HEADERS, json=order_data)
-    return jsonify(response.json()), response.status_code
+    resp = requests.post(OANDA_URL, headers=HEADERS, json=order_body)
+    return (resp.text, resp.status_code)
 
 if __name__ == "__main__":
-    app.run(port=5000)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
