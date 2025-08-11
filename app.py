@@ -3,13 +3,23 @@ import os, requests, json
 
 app = Flask(__name__)
 
+# === OANDA creds (Render env vars) ===
 OANDA_ACCOUNT_ID = os.environ["OANDA_ACCOUNT_ID"]
 OANDA_API_KEY    = os.environ["OANDA_API_KEY"]
 
+# LIVE endpoint (you said you're live)
 OANDA_URL = f"https://api-fxtrade.oanda.com/v3/accounts/{OANDA_ACCOUNT_ID}/orders"
 HEADERS = {
     "Authorization": f"Bearer {OANDA_API_KEY}",
     "Content-Type":  "application/json"
+}
+
+# Optional: map action to signed units (buy/close short = +, sell/close long = -)
+SIGN_MAP = {
+    "buy":        +1,
+    "sell":       -1,
+    "close_buy":  -1,   # close a long by selling
+    "close_sell": +1    # close a short by buying
 }
 
 @app.route("/webhook", methods=["POST", "GET"])
@@ -24,30 +34,33 @@ def webhook():
         try:
             data = json.loads(raw)
         except Exception:
-            pass
+            data = None
 
     if not isinstance(data, dict):
-        # log and reply 200 so TV stops retrying; nothing to do
         print("WARN: Invalid/empty payload:", raw, flush=True)
-        return jsonify({"ignored": "invalid or empty payload"}), 200
+        return jsonify({"ignored": "invalid or empty payload"}), 200  # TV stops retrying
 
     try:
         action = str(data.get("action"))
         units  = int(data.get("units", 1))
         instr  = str(data.get("instrument", "EUR_USD"))
 
-        order_units = units if action in ["buy", "close_sell"] else -units
-        order = {
+        if action not in SIGN_MAP:
+            return jsonify({"error": f"unknown action '{action}'"}), 200
+
+        signed_units = SIGN_MAP[action] * abs(units)
+        body = {
             "order": {
-                "instrument": instr,
-                "units": str(order_units),
-                "type": "MARKET",
-                "positionFill": "DEFAULT"
+                "instrument":  instr,
+                "units":       str(signed_units),
+                "type":        "MARKET",
+                "positionFill":"DEFAULT"
             }
         }
 
-        resp = requests.post(OANDA_URL, headers=HEADERS, json=order)
-        print("IN:", data, "OUT:", resp.status_code, resp.text, flush=True)
+        resp = requests.post(OANDA_URL, headers=HEADERS, json=body, timeout=15)
+        print("IN:", data, "| OUT:", resp.status_code, resp.text[:400], flush=True)
+
         try:
             return jsonify({"status": "sent", "response": resp.json()}), resp.status_code
         except Exception:
@@ -56,3 +69,6 @@ def webhook():
     except Exception as e:
         print("ERR:", e, "PAYLOAD:", data, flush=True)
         return jsonify({"error": str(e)}), 200
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
