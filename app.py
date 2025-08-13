@@ -1,114 +1,99 @@
 # app.py
 from flask import Flask, request, jsonify
-import os, json, requests
+import os, requests, math
 
 app = Flask(__name__)
 
-# ── ENV ─────────────────────────────────────────────
-OANDA_ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID", "").strip()
-OANDA_API_KEY    = os.environ.get("OANDA_API_KEY", "").strip()
-# Optional override (recommended you set this in Render):
-OANDA_URL        = os.environ.get("OANDA_URL", "").strip()
-
-# Fallback to LIVE if OANDA_URL not provided
-if not OANDA_URL and OANDA_ACCOUNT_ID:
-    OANDA_URL = f"https://api-fxtrade.oanda.com/v3/accounts/{OANDA_ACCOUNT_ID}/orders"
+# —— ENV (live, not practice)
+OANDA_ACCOUNT_ID = os.environ["OANDA_ACCOUNT_ID"]
+OANDA_API_KEY    = os.environ["OANDA_API_KEY"]
+BASE             = "https://api-fxtrade.oanda.com/v3"  # live
 
 HEADERS = {
     "Authorization": f"Bearer {OANDA_API_KEY}",
-    "Content-Type":  "application/json",
-    "Accept":        "application/json",
+    "Content-Type":  "application/json"
 }
 
-ALLOWED_ACTIONS = {"buy", "sell", "close_buy", "close_sell"}
+# Force % of equity for order sizing (80% default)
+RISK_PCT = float(os.getenv("FORCE_RISK_PCT", "80"))
 
-# ── Helpers ─────────────────────────────────────────
-def fmt_instrument(symbol: str) -> str:
-    s = (symbol or "").strip().upper()
-    if "_" in s: return s
-    return s[:3] + "_" + s[3:] if len(s) >= 6 else s
+# Map action to sign
+SIGN = {
+    "buy":        +1,
+    "sell":       -1,
+    "close_buy":  -1,  # reduce a long
+    "close_sell": +1   # reduce a short
+}
 
-def build_order_payload(action: str, instrument: str, units: int) -> dict:
-    instrument = fmt_instrument(instrument)
-    u = abs(int(units))
-    if action == "buy":          signed, fill = +u, "DEFAULT"
-    elif action == "sell":       signed, fill = -u, "DEFAULT"
-    elif action == "close_buy":  signed, fill = -u, "REDUCE_ONLY"
-    elif action == "close_sell": signed, fill = +u, "REDUCE_ONLY"
-    else: raise ValueError("Unsupported action")
-    return {"order": {"instrument": instrument, "units": str(signed),
-                      "type": "MARKET", "positionFill": fill}}
+def normalize_instr(instr: str) -> str:
+    """Accept EUR_USD or EUR/USD and return OANDA 'EUR_USD'."""
+    return instr.replace("/", "_").upper()
 
-def parse_body(req) -> dict:
-    data = req.get_json(silent=True)
-    if not data:
-        raw = (req.data or b"").decode("utf-8", "ignore").strip()
-        if not raw: raise ValueError("Empty body")
-        try: data = json.loads(raw)
-        except json.JSONDecodeError: raise ValueError("Invalid JSON body")
-    if not isinstance(data, dict): raise ValueError("Body must be a JSON object")
-    missing = [k for k in ("action","instrument","units") if k not in data]
-    if missing: raise ValueError(f"Missing fields: {', '.join(missing)}")
-    action = str(data["action"]).strip().lower()
-    if action not in ALLOWED_ACTIONS: raise ValueError(f"Invalid action '{action}'")
-    instrument = str(data["instrument"]).strip()
-    try: units = int(data["units"])
-    except: raise ValueError("units must be an integer")
-    if units <= 0: raise ValueError("units must be > 0")
-    return {"action": action, "instrument": instrument, "units": units}
+def get_balance() -> float:
+    """Live account balance (base currency)"""
+    url = f"{BASE}/accounts/{OANDA_ACCOUNT_ID}/summary"
+    r = requests.get(url, headers=HEADERS, timeout=15)
+    r.raise_for_status()
+    return float(r.json()["account"]["balance"])
 
-def env_ok():
-    if not OANDA_ACCOUNT_ID: return False, "OANDA_ACCOUNT_ID missing"
-    if not OANDA_API_KEY:    return False, "OANDA_API_KEY missing"
-    if not OANDA_URL:        return False, "OANDA_URL missing"
-    return True, "ok"
+def calc_units(balance: float, price: float | None = None) -> int:
+    """
+    Very simple sizing: units = floor(balance * RISK_PCT%)
+    (You’re trading FX units directly; adjust if you want price- or leverage-based sizing.)
+    """
+    units = math.floor(balance * (RISK_PCT / 100.0))
+    return max(units, 1)
 
-# ── Routes ──────────────────────────────────────────
-@app.get("/")
-def index():
-    return "✅ TGIM OANDA Webhook is up. Try GET /health or POST /webhook", 200
+def place_market_order(instr: str, signed_units: int, reduce_only: bool = False):
+    """Send a MARKET order. If reduce_only, use REDUCE_ONLY positionFill."""
+    body = {
+        "order": {
+            "instrument": instr,
+            "units": str(signed_units),
+            "type": "MARKET",
+            "positionFill": "REDUCE_ONLY" if reduce_only else "DEFAULT"
+        }
+    }
+    url = f"{BASE}/accounts/{OANDA_ACCOUNT_ID}/orders"
+    r = requests.post(url, headers=HEADERS, json=body, timeout=20)
+    return r
 
-@app.get("/health")
-def health():
-    ok, msg = env_ok()
-    return jsonify({
-        "ok": ok, "message": msg,
-        "account": OANDA_ACCOUNT_ID,
-        "orders_url": OANDA_URL
-    }), 200 if ok else 500
-
-@app.route("/webhook", methods=["GET", "POST"])
+@app.route("/webhook", methods=["POST", "GET"])
 def webhook():
     if request.method == "GET":
-        return "✅ /webhook alive. POST JSON to execute.", 200
+        return "✅ TGIM Webhook is live (forced 80% equity sizing)", 200
+
+    data = request.get_json(silent=True) or {}
+    action = str(data.get("action", "")).lower().strip()
+    instr  = normalize_instr(str(data.get("instrument", "")))
+
+    if action not in SIGN or not instr or "_" not in instr:
+        return jsonify({"ok": False, "error": "bad payload", "got": data}), 400
+
     try:
-        # debug to logs
-        print("=== HEADERS ===", dict(request.headers))
-        print("=== RAW BODY ===", (request.data or b"").decode("utf-8", "ignore"))
-        print("=== OANDA_URL ==", OANDA_URL)
+        balance = get_balance()
+        # If you want to fetch price to do price-based sizing, do it here.
+        units = calc_units(balance)
+        signed_units = SIGN[action] * units
+        reduce_only  = action in ("close_buy", "close_sell")
 
-        ok, msg = env_ok()
-        if not ok:
-            return jsonify({"ok": False, "error": msg}), 500
+        resp = place_market_order(instr, signed_units, reduce_only=reduce_only)
+        ok   = resp.status_code in (200, 201)
 
-        p = parse_body(request)
-        order = build_order_payload(**p)
-
-        # send to OANDA, mirror their reply
-        r = requests.post(OANDA_URL, headers=HEADERS, json=order, timeout=15)
-        try:
-            body = r.json()
-        except Exception:
-            body = {"raw": r.text}
-        print("=== OANDA RESP ===", r.status_code, body)
-        return jsonify(body), r.status_code
-
-    except ValueError as e:
-        return jsonify({"ok": False, "error": str(e)}), 400
-    except requests.RequestException as e:
-        return jsonify({"ok": False, "error": f"OANDA request failed: {e}"}), 502
+        return jsonify({
+            "ok": ok,
+            "action": action,
+            "instrument": instr,
+            "equity": balance,
+            "risk_pct": RISK_PCT,
+            "units_forced": abs(units),
+            "signed_units": signed_units,
+            "reduce_only": reduce_only,
+            "oanda_status": resp.status_code,
+            "oanda_body": resp.json() if resp.headers.get("content-type","").startswith("application/json") else resp.text
+        }), resp.status_code
     except Exception as e:
-        return jsonify({"ok": False, "error": f"Server error: {e}"}), 500
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
