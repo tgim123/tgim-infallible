@@ -1,131 +1,102 @@
 # app.py
 from flask import Flask, request, jsonify
-import os, requests, json, re
+import os, requests, json
 
 app = Flask(__name__)
 
-# ==== OANDA (LIVE) ====
-OANDA_ACCOUNT_ID = os.environ["OANDA_ACCOUNT_ID"]
-OANDA_API_KEY    = os.environ["OANDA_API_KEY"]
-OANDA_URL = f"https://api-fxtrade.oanda.com/v3/accounts/{OANDA_ACCOUNT_ID}/orders"  # LIVE, not practice
+# ---- Config (env vars on Render) ----
+OANDA_ACCOUNT_ID = os.environ["OANDA_ACCOUNT_ID"]  # e.g. 001-001-xxxxxxx-001
+OANDA_API_KEY    = os.environ["OANDA_API_KEY"]     # live or practice key
+OANDA_URL        = f"https://api-fxtrade.oanda.com/v3/accounts/{OANDA_ACCOUNT_ID}/orders"
+# For practice accounts use: https://api-fxpractice.oanda.com/...
 HEADERS = {
     "Authorization": f"Bearer {OANDA_API_KEY}",
     "Content-Type":  "application/json"
 }
 
-ALLOWED = {"buy","sell","close_buy","close_sell"}
+# action -> sign (+ = buy, - = sell). close_* are REDUCE_ONLY market orders.
+SIGN = {
+    "buy":        +1,
+    "sell":       -1,
+    "close_buy":  -1,   # close long by selling
+    "close_sell": +1    # close short by buying
+}
 
-def parse_body():
-    """
-    Accept TradingView text/plain or JSON.
-    Try JSON first, then parse simple k=v or raw text.
-    """
-    # 1) JSON if possible
-    data = request.get_json(silent=True)
-    if isinstance(data, dict):
-        return data, None
+def sanitize_instrument(sym: str) -> str:
+    # Ensure OANDA format like EUR_USD
+    s = (sym or "").upper().replace("-", "_").strip()
+    return s
 
-    raw = (request.data or b"").decode("utf-8").strip()
-    if not raw:
-        return None, "Empty body"
-
-    # 2) Raw JSON string with single quotes? -> convert to valid JSON
-    if raw.startswith("{") and raw.endswith("}"):
-        try:
-            return json.loads(raw.replace("'", '"')), None
-        except Exception as e:
-            return None, f"Invalid JSON: {e}"
-
-    # 3) Fallback: parse key=value;key2=value2 or action:buy, etc.
-    # e.g., action=buy;instrument=EURUSD;units=100
-    kv = {}
-    for part in re.split(r"[;,&\n ]+", raw):
-        if "=" in part:
-            k,v = part.split("=",1)
-            kv[k.strip()] = v.strip()
-        elif ":" in part:
-            k,v = part.split(":",1)
-            kv[k.strip()] = v.strip()
-    if kv:
-        return kv, None
-
-    return None, "Unrecognized body format"
-
-def norm_instrument(instr: str) -> str:
-    if not instr: 
-        return ""
-    # Accept EURUSD, eurusd, EUR_USD, OANDA:EUR_USD, FX:GBPJPY, etc.
-    t = instr.upper()
-    t = t.split(":")[-1]               # drop prefix
-    t = t.replace("-", "").replace(" ", "").replace("/", "").replace(".", "")
-    t = t.replace("__","_")
-    t = t.replace("_","")              # strip underscores to rebuild cleanly
-    if len(t) < 6: 
-        return ""
-    base, quote = t[:3], t[3:6]
-    return f"{base}_{quote}"
-
-def norm_units(val) -> int:
-    try:
-        return int(float(val))
-    except:
-        return 0
-
-def map_action_to_signed_units(action: str, units: int) -> int:
-    # buy / close short => +units; sell / close long => -units
-    if action == "buy":         return +units
-    if action == "sell":        return -units
-    if action == "close_buy":   return -units   # closing a long by selling
-    if action == "close_sell":  return +units   # closing a short by buying
-    return 0
-
-@app.route("/health", methods=["GET"])
-def health():
-    return "✅ TGIM Webhook live", 200
-
-@app.route("/webhook", methods=["POST","GET"])
-def webhook():
-    if request.method == "GET":
-        return "✅ TGIM Webhook live", 200
-
-    data, err = parse_body()
-    if err:
-        return jsonify({"ok": False, "reason": err}), 400
-
-    action = str(data.get("action","")).strip().lower()
-    instrument_raw = str(data.get("instrument","")).strip()
-    units_raw = data.get("units", "")
-    instrument = norm_instrument(instrument_raw)
-    units = norm_units(units_raw)
-
-    if action not in ALLOWED:
-        return jsonify({"ok": False, "reason": f"Invalid action '{action}'. Allowed: {sorted(ALLOWED)}"}), 400
-    if not instrument:
-        return jsonify({"ok": False, "reason": f"Invalid instrument '{instrument_raw}'. Expect e.g. EUR_USD or EURUSD"}), 400
-    if units <= 0:
-        return jsonify({"ok": False, "reason": f"Invalid units '{units_raw}'"}), 400
-
-    signed_units = map_action_to_signed_units(action, units)
-
+def build_order_payload(action: str, instrument: str, units: int) -> dict:
+    signed_units = SIGN[action] * int(units)
     payload = {
         "order": {
-            "units": str(signed_units),
             "instrument": instrument,
+            "units": str(signed_units),     # OANDA wants string
             "timeInForce": "FOK",
             "type": "MARKET",
             "positionFill": "DEFAULT"
         }
     }
+    # Close-only so we don't flip by accident
+    if action.startswith("close_"):
+        payload["order"]["positionFill"] = "REDUCE_ONLY"
+    return payload
 
+@app.route("/webhook", methods=["GET", "POST"])
+def webhook():
+    if request.method == "GET":
+        return "✅ TGIM Webhook is live", 200
+
+    # Accept both raw JSON and plain text; never crash
+    raw = (request.data or b"").decode("utf-8").strip()
+    data = request.get_json(silent=True)
+    if data is None:
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return jsonify({"ok": False, "error": "Invalid JSON", "raw": raw}), 400
+
+    action = str(data.get("action", "")).strip()
+    instrument = sanitize_instrument(str(data.get("instrument", "")))
+    units = data.get("units", None)
+
+    # Validate inputs
+    if action not in SIGN:
+        return jsonify({"ok": False, "error": f"Unsupported action '{action}'", "allowed": list(SIGN)}), 400
+    if not instrument:
+        return jsonify({"ok": False, "error": "Missing instrument"}), 400
     try:
-        r = requests.post(OANDA_URL, headers=HEADERS, data=json.dumps(payload), timeout=10)
-        if r.status_code >= 200 and r.status_code < 300:
-            return jsonify({"ok": True, "action": action, "instrument": instrument, "units": signed_units, "oanda_status": r.status_code}), 200
-        else:
-            # Bubble up OANDA error for debugging
-            return jsonify({"ok": False, "reason": "OANDA rejected", "status": r.status_code, "body": r.text}), 502
+        units = int(units)
+        if units <= 0:
+            raise ValueError()
+    except Exception:
+        return jsonify({"ok": False, "error": "Invalid units (must be positive integer)"}), 400
+
+    # Build and send OANDA Market Order
+    order_payload = build_order_payload(action, instrument, units)
+    try:
+        r = requests.post(OANDA_URL, headers=HEADERS, json=order_payload, timeout=15)
+        resp_text = r.text
     except Exception as e:
-        return jsonify({"ok": False, "reason": f"Exception posting to OANDA: {e}"}), 502
+        return jsonify({"ok": False, "error": f"Request to OANDA failed: {e}"}), 502
+
+    # Bubble up OANDA result (no silent 200s)
+    try:
+        resp_json = r.json()
+    except Exception:
+        resp_json = {"raw": resp_text}
+
+    status_ok = 200 <= r.status_code < 300
+    return (
+        jsonify({"ok": status_ok, "status": r.status_code, "oanda": resp_json, "sent": order_payload}),
+        r.status_code if not status_ok else 200
+    )
+
+# Optional health route for Render
+@app.route("/", methods=["GET"])
+def root():
+    return "TGIM up", 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
