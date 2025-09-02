@@ -1,120 +1,141 @@
-# app.py
 from flask import Flask, request, jsonify
-import os, requests, json
-from datetime import datetime
+import os
+import requests
+import json
+import uuid
+from datetime import datetime, timezone
 
 app = Flask(__name__)
 
-# ── OANDA config (LIVE host by default)
-OANDA_ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID", "").strip()
-OANDA_API_KEY    = os.environ.get("OANDA_API_KEY", "").strip()
-WEBHOOK_SECRET   = os.environ.get("WEBHOOK_SECRET", "").strip()  # optional
+# ── Env / Config ─────────────────────────────────────────────────────────────
+OANDA_ACCOUNT_ID = (os.environ.get("OANDA_ACCOUNT_ID") or "").strip()
+OANDA_API_KEY    = (os.environ.get("OANDA_API_KEY") or "").strip()
+
+# true/false, 1/0, yes/no all supported (default: practice TRUE)
+USE_PRACTICE     = (os.environ.get("USE_PRACTICE", "true").strip().lower()
+                    in ("1", "true", "yes", "y"))
+
+WEBHOOK_SECRET   = (os.environ.get("WEBHOOK_SECRET") or "").strip()  # optional
+DEFAULT_UNITS    = int((os.environ.get("DEFAULT_UNITS") or "0").strip() or "0")
+LOG_FILE         = os.environ.get("LOG_FILE", "webhook.log")
 
 if not OANDA_ACCOUNT_ID or not OANDA_API_KEY:
-    raise RuntimeError("Missing OANDA_ACCOUNT_ID or OANDA_API_KEY env vars")
+    raise RuntimeError("Missing OANDA_ACCOUNT_ID or OANDA_API_KEY env vars.")
 
-OANDA_BASE      = f"https://api-fxtrade.oanda.com/v3/accounts/{OANDA_ACCOUNT_ID}"
-OANDA_ORDER_URL = f"{OANDA_BASE}/orders"
-OANDA_POS_URL   = f"{OANDA_BASE}/positions"
+BASE_HOST        = "https://api-fxpractice.oanda.com" if USE_PRACTICE else "https://api-fxtrade.oanda.com"
+OANDA_BASE       = f"{BASE_HOST}/v3/accounts/{OANDA_ACCOUNT_ID}"
+OANDA_ORDER_URL  = f"{OANDA_BASE}/orders"
 
 HEADERS = {
     "Authorization": f"Bearer {OANDA_API_KEY}",
-    "Content-Type": "application/json"
+    "Content-Type": "application/json",
+    # Idempotency helpful during retries; per-request UUID
+    "X-Request-ID": str(uuid.uuid4()),
 }
 
-def log_line(kind, content):
-    print(f"{datetime.utcnow().isoformat()}Z | {kind} | {content}", flush=True)
-
-def to_json(resp):
+# ── Logging ──────────────────────────────────────────────────────────────────
+def log_event(event_type, content):
+    line = f"{datetime.now(timezone.utc).isoformat()}Z | {event_type} | {content}"
     try:
-        return resp.json()
-    except ValueError:
-        return {"status_code": resp.status_code, "text": resp.text[:2000]}
-
-@app.get("/")
-def health():
-    return "✅ TGIM Web Service live", 200
-
-@app.post("/webhook")
-def webhook():
-    if WEBHOOK_SECRET:
-        got = request.headers.get("X-Webhook-Secret", "")
-        if got != WEBHOOK_SECRET:
-            log_line("AUTH_FAIL", f"bad secret {got!r}")
-            return jsonify({"error": "unauthorized"}), 401
-
-    raw = (request.data or b"").decode("utf-8", errors="ignore")
-    log_line("RX", raw[:2000])
-
-    data = request.get_json(silent=True)
-    if not isinstance(data, dict):
-        try:
-            data = json.loads(raw) if raw else {}
-        except json.JSONDecodeError:
-            return jsonify({"error": "invalid_json"}), 400
-
-    action     = (data.get("action") or "").strip().lower()          # buy | sell | close_buy | close_sell
-    instrument = (data.get("instrument") or data.get("symbol") or "").strip()
-    units_val  = data.get("units", data.get("qty", 0))
-
-    try:
-        units = int(round(float(units_val)))
+        with open(LOG_FILE, "a") as f:
+            f.write(line + "\n")
     except Exception:
-        units = 0
+        pass
+    print(line, flush=True)
 
-    if not action or not instrument:
-        return jsonify({"error": "missing_action_or_instrument"}), 400
+# ── Helpers ──────────────────────────────────────────────────────────────────
+def parse_units(value):
+    """Accept int/float/str -> int. '100.0' → 100. None/invalid → 0."""
+    if value is None:
+        return 0
+    try:
+        if isinstance(value, str):
+            v = value.strip()
+            if v.upper() == "ALL":  # for close payloads (not used in market orders)
+                return v
+            return int(float(v))
+        return int(float(value))
+    except Exception:
+        return 0
+
+def normalize_instrument(sym):
+    """
+    Accepts: 'OANDA:EURUSD', 'EURUSD', 'EUR_USD', 'XAUUSD', 'NAS100USD'
+    Returns: 'EUR_USD', 'XAU_USD', 'NAS100_USD'
+    """
+    if not sym:
+        return None
+    s = str(sym).strip().upper()
+    if ":" in s:
+        s = s.split(":", 1)[1]  # drop 'OANDA:' prefix
+    s = s.replace("_", "").replace("/", "").replace("-", "")
+    if len(s) < 6:
+        return None
+    base = s[:-3]
+    quote = s[-3:]
+    return f"{base}_{quote}"
+
+def get_secret_from_request(req_json):
+    # Allow header or JSON field
+    header_secret = request.headers.get("X-Webhook-Secret")
+    body_secret   = None
+    if isinstance(req_json, dict):
+        body_secret = req_json.get("secret")
+    return header_secret or body_secret
+
+def post_oanda(url, payload):
+    log_event("OANDA_REQUEST", json.dumps(payload))
+    r = requests.post(url, headers=HEADERS, json=payload, timeout=15)
+    try:
+        resp_json = r.json()
+    except Exception:
+        resp_json = {"text": r.text}
+    log_event("OANDA_RESPONSE", json.dumps({"status": r.status_code, "body": resp_json}))
+    return r.status_code, resp_json
+
+def put_oanda(url, payload):
+    log_event("OANDA_REQUEST", json.dumps(payload))
+    r = requests.put(url, headers=HEADERS, json=payload, timeout=15)
+    try:
+        resp_json = r.json()
+    except Exception:
+        resp_json = {"text": r.text}
+    log_event("OANDA_RESPONSE", json.dumps({"status": r.status_code, "body": resp_json}))
+    return r.status_code, resp_json
+
+# ── Routes ───────────────────────────────────────────────────────────────────
+@app.route("/webhook", methods=["GET", "POST"])
+def webhook():
+    if request.method == "GET":
+        mode = "practice" if USE_PRACTICE else "live"
+        return f"✅ TGIM Webhook is live ({mode})", 200
 
     try:
-        if action == "buy":
-            if units <= 0: return jsonify({"error":"units_must_be_positive"}), 400
-            order = {"order":{
-                "instrument": instrument,
-                "units": str(units),        # positive
-                "type": "MARKET",
-                "timeInForce": "FOK",
-                "positionFill": "DEFAULT"
-            }}
-            r = requests.post(OANDA_ORDER_URL, headers=HEADERS, json=order, timeout=15)
-            body = to_json(r)
-            log_line("ORDER", {"inst":instrument,"units":units,"code":r.status_code})
-            return jsonify(body), r.status_code
+        raw = (request.data or b"").decode("utf-8", errors="ignore").strip()
+        data = request.get_json(silent=True)
 
-        if action == "sell":
-            if units <= 0: return jsonify({"error":"units_must_be_positive"}), 400
-            order = {"order":{
-                "instrument": instrument,
-                "units": str(-abs(units)),  # negative
-                "type": "MARKET",
-                "timeInForce": "FOK",
-                "positionFill": "DEFAULT"
-            }}
-            r = requests.post(OANDA_ORDER_URL, headers=HEADERS, json=order, timeout=15)
-            body = to_json(r)
-            log_line("ORDER", {"inst":instrument,"units":-abs(units),"code":r.status_code})
-            return jsonify(body), r.status_code
+        log_event("RAW_REQUEST", raw if raw else "<empty>")
 
-        if action == "close_buy":
-            url = f"{OANDA_POS_URL}/{instrument}/close"
-            r = requests.put(url, headers=HEADERS, json={"longUnits":"ALL"}, timeout=15)
-            body = to_json(r)
-            log_line("CLOSE", {"inst":instrument,"side":"long","code":r.status_code})
-            return jsonify(body), r.status_code
+        if data is None and raw:
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                log_event("ERROR", "Invalid JSON payload")
+                return jsonify({"error": "Invalid JSON"}), 400
 
-        if action == "close_sell":
-            url = f"{OANDA_POS_URL}/{instrument}/close"
-            r = requests.put(url, headers=HEADERS, json={"shortUnits":"ALL"}, timeout=15)
-            body = to_json(r)
-            log_line("CLOSE", {"inst":instrument,"side":"short","code":r.status_code})
-            return jsonify(body), r.status_code
+        if not isinstance(data, dict):
+            log_event("ERROR", "Invalid payload format")
+            return jsonify({"error": "Invalid payload format"}), 400
 
-        return jsonify({"error": f"unknown_action:{action}"}), 400
+        # Optional secret gate
+        if WEBHOOK_SECRET:
+            sent = get_secret_from_request(data)
+            if sent != WEBHOOK_SECRET:
+                log_event("ERROR", "Unauthorized: bad/missing secret")
+                return jsonify({"error": "Unauthorized"}), 401
 
-    except Exception as e:
-        log_line("ERROR", str(e))
-        return jsonify({"error": str(e)}), 500
+        # Accept old & new keys
+        action_raw  = data.get("action") or data.get("side") or ""
+        action      = str(action_raw).strip().lower()
 
-if __name__ == "__main__":
-    import os
-    port = int(os.environ.get("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+        instr_raw   = data.get("ins_
