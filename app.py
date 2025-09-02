@@ -1,107 +1,76 @@
 from flask import Flask, request, jsonify
-import os
-import requests
-import json
-from datetime import datetime
+import os, json, requests
 
 app = Flask(__name__)
 
-# OANDA config from environment
-OANDA_ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID")
-OANDA_API_KEY    = os.environ.get("OANDA_API_KEY")
+# Required env vars
+ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID", "").strip()
+API_KEY    = os.environ.get("OANDA_API_KEY", "").strip()
 
-OANDA_BASE       = f"https://api-fxtrade.oanda.com/v3/accounts/{OANDA_ACCOUNT_ID}"
-OANDA_ORDER_URL  = f"{OANDA_BASE}/orders"
+if not ACCOUNT_ID or not API_KEY:
+    raise RuntimeError("Missing OANDA_ACCOUNT_ID or OANDA_API_KEY in environment.")
+
+# 🔥 LIVE host only
+BASE_HOST = "https://api-fxtrade.oanda.com"
+BASE_URL  = f"{BASE_HOST}/v3/accounts/{ACCOUNT_ID}"
+ORDERS_URL = f"{BASE_URL}/orders"
+
 HEADERS = {
-    "Authorization": f"Bearer {OANDA_API_KEY}",
+    "Authorization": f"Bearer {API_KEY}",
     "Content-Type": "application/json"
 }
 
-LOG_FILE = "webhook.log"
+def place_market_order(instrument, units):
+    payload = {
+        "order": {
+            "instrument": instrument,
+            "units": str(int(units)),
+            "type": "MARKET",
+            "timeInForce": "FOK",
+            "positionFill": "DEFAULT"
+        }
+    }
+    r = requests.post(ORDERS_URL, headers=HEADERS, data=json.dumps(payload), timeout=15)
+    return r.status_code, r.json() if r.content else {}
 
-def log_event(event_type, content):
-    """Append a timestamped log entry to webhook.log"""
-    try:
-        with open(LOG_FILE, "a") as f:
-            f.write(f"{datetime.utcnow().isoformat()}Z | {event_type} | {content}\n")
-    except Exception as e:
-        print(f"Logging error: {e}")
+def close_position(instrument, side="both"):
+    url = f"{BASE_URL}/positions/{instrument}/close"
+    body = {}
+    if side in ("long", "both"):
+        body["longUnits"] = "ALL"
+    if side in ("short", "both"):
+        body["shortUnits"] = "ALL"
+    r = requests.put(url, headers=HEADERS, data=json.dumps(body), timeout=15)
+    return r.status_code, r.json() if r.content else {}
 
-@app.route("/webhook", methods=["POST", "GET"])
+def normalize(sym):
+    s = sym.replace("OANDA:", "").replace(":", "").upper()
+    if "_" in s: return s
+    if len(s) == 6: return f"{s[:3]}_{s[3:]}"
+    if s == "XAUUSD": return "XAU_USD"
+    return s
+
+@app.route("/webhook", methods=["POST"])
 def webhook():
-    if request.method == "GET":
-        return "✅ TGIM Webhook is live", 200
+    data = request.get_json(silent=True) or {}
+    if isinstance(data, str):
+        data = json.loads(data)
 
-    try:
-        raw  = (request.data or b"").decode("utf-8").strip()
-        data = request.get_json(silent=True)
+    action     = str(data.get("action", "")).lower().strip()
+    instrument = normalize(data.get("instrument") or data.get("symbol") or "")
+    units      = int(float(data.get("units", data.get("qty", 0))))
 
-        log_event("RAW_REQUEST", raw)
-
-        if data is None and raw:
-            try:
-                data = json.loads(raw)
-            except json.JSONDecodeError:
-                log_event("ERROR", "Invalid JSON payload")
-                return jsonify({"error": "Invalid JSON"}), 400
-
-        if not isinstance(data, dict):
-            log_event("ERROR", "Invalid payload format")
-            return jsonify({"error": "Invalid payload format"}), 400
-
-        action     = data.get("action")
-        instrument = data.get("instrument")
-        units      = int(data.get("units", 0)) if "units" in data else 0
-
-        if not action or not instrument:
-            log_event("ERROR", "Missing action or instrument")
-            return jsonify({"error": "Missing action or instrument"}), 400
-
-        # ---- BUY ----
-        if action == "buy":
-            order = {
-                "order": {
-                    "instrument": instrument,
-                    "units": str(abs(units)),
-                    "type": "MARKET",
-                    "positionFill": "DEFAULT"
-                }
-            }
-            r = requests.post(OANDA_ORDER_URL, headers=HEADERS, json=order)
-
-        # ---- SELL ----
-        elif action == "sell":
-            order = {
-                "order": {
-                    "instrument": instrument,
-                    "units": str(-abs(units)),
-                    "type": "MARKET",
-                    "positionFill": "DEFAULT"
-                }
-            }
-            r = requests.post(OANDA_ORDER_URL, headers=HEADERS, json=order)
-
-        # ---- CLOSE LONG ----
-        elif action == "close_buy":
-            close_url = f"{OANDA_BASE}/positions/{instrument}/close"
-            r = requests.put(close_url, headers=HEADERS, json={"longUnits": "ALL"})
-
-        # ---- CLOSE SHORT ----
-        elif action == "close_sell":
-            close_url = f"{OANDA_BASE}/positions/{instrument}/close"
-            r = requests.put(close_url, headers=HEADERS, json={"shortUnits": "ALL"})
-
-        else:
-            log_event("ERROR", f"Unknown action: {action}")
-            return jsonify({"error": "Unknown action"}), 400
-
-        log_event("OANDA_RESPONSE", json.dumps(r.json()))
-        return jsonify(r.json()), r.status_code
-
-    except Exception as e:
-        log_event("ERROR", str(e))
-        return jsonify({"error": str(e)}), 500
-
+    if action == "buy":
+        return jsonify(place_market_order(instrument, abs(units)))
+    elif action == "sell":
+        return jsonify(place_market_order(instrument, -abs(units)))
+    elif action == "close":
+        side = str(data.get("side", "both")).lower()
+        return jsonify(close_position(instrument, side=side))
+    elif action == "close_all":
+        return jsonify(close_position(instrument, side="both"))
+    else:
+        return jsonify(ok=True, ignored=True), 200
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))
