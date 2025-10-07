@@ -1,9 +1,18 @@
+# TGIM Infallible OANDA Webhook — Full Version
+# --------------------------------------------
+# Live trading bridge between TradingView and OANDA (REST API v3)
+# with normalized instruments, precise integer unit conversion,
+# structured logging, and full OANDA response visibility.
+
 from flask import Flask, request, jsonify
 import os, json, requests
 from decimal import Decimal, InvalidOperation
 
 app = Flask(__name__)
 
+#──────────────────────────────────────────────
+# Environment Setup
+#──────────────────────────────────────────────
 ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID", "").strip()
 API_KEY    = os.environ.get("OANDA_API_KEY", "").strip()
 if not ACCOUNT_ID or not API_KEY:
@@ -15,6 +24,9 @@ BASE_URL   = f"{BASE_HOST}/v3/accounts/{ACCOUNT_ID}"
 ORDERS_URL = f"{BASE_URL}/orders"
 HEADERS    = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
 
+#──────────────────────────────────────────────
+# Utility: Normalize symbols to OANDA format
+#──────────────────────────────────────────────
 def normalize(sym: str) -> str:
     """Normalize common symbol forms to OANDA format like 'EUR_USD' or 'XAU_USD'."""
     s = str(sym or "").upper().strip()
@@ -26,6 +38,9 @@ def normalize(sym: str) -> str:
         return f"{s[:3]}_{s[3:]}"
     return s
 
+#──────────────────────────────────────────────
+# Utility: Convert any numeric to integer units
+#──────────────────────────────────────────────
 def to_int_units(val) -> int:
     """Exact integer coercion with sane rounding; avoids float precision issues."""
     if val is None:
@@ -37,6 +52,29 @@ def to_int_units(val) -> int:
     n = int(q)
     return 1 if n < 1 else n
 
+#──────────────────────────────────────────────
+# Utility: Log full OANDA response
+#──────────────────────────────────────────────
+def log_oanda_response(tag: str, response):
+    """Print full OANDA reply to console for Render logs."""
+    try:
+        body = response.json()
+    except Exception:
+        body = {"text": response.text}
+
+    print(f"\n🔹 [{tag}] Status: {response.status_code}")
+    print("🔸 URL:", response.url)
+    try:
+        req_body = response.request.body.decode() if isinstance(response.request.body, (bytes, bytearray)) else str(response.request.body)
+    except Exception:
+        req_body = str(response.request.body)
+    print("📦 Payload snippet:", str(req_body)[:250])
+    print("📜 Response snippet:", str(body)[:500])
+    print("──────────────────────────────────────────────\n")
+
+#──────────────────────────────────────────────
+# Function: Place Market Order
+#──────────────────────────────────────────────
 def place_market_order(instrument: str, signed_units: int):
     payload = {
         "order": {
@@ -48,27 +86,49 @@ def place_market_order(instrument: str, signed_units: int):
         }
     }
     r = requests.post(ORDERS_URL, headers=HEADERS, json=payload, timeout=15)
+    log_oanda_response("OANDA-ORDER", r)
     try:
         body = r.json()
     except Exception:
         body = {"text": r.text}
-    app.logger.info({"action": "order", "status": r.status_code, "units": signed_units, "instrument": instrument, "resp_snip": str(body)[:300]})
+    app.logger.info({
+        "action": "order",
+        "status": r.status_code,
+        "units": signed_units,
+        "instrument": instrument,
+        "resp_snip": str(body)[:300]
+    })
     return r.status_code, body
 
+#──────────────────────────────────────────────
+# Function: Close Position
+#──────────────────────────────────────────────
 def close_position(instrument: str, side: str = "both"):
     url = f"{BASE_URL}/positions/{instrument}/close"
     body = {}
     side = (side or "both").lower().strip()
-    if side in ("long", "both"):  body["longUnits"]  = "ALL"
-    if side in ("short", "both"): body["shortUnits"] = "ALL"
+    if side in ("long", "both"):
+        body["longUnits"]  = "ALL"
+    if side in ("short", "both"):
+        body["shortUnits"] = "ALL"
     r = requests.put(url, headers=HEADERS, json=body, timeout=15)
+    log_oanda_response("OANDA-CLOSE", r)
     try:
         resp = r.json()
     except Exception:
         resp = {"text": r.text}
-    app.logger.info({"action": "close", "status": r.status_code, "instrument": instrument, "side": side, "resp_snip": str(resp)[:300]})
+    app.logger.info({
+        "action": "close",
+        "status": r.status_code,
+        "instrument": instrument,
+        "side": side,
+        "resp_snip": str(resp)[:300]
+    })
     return r.status_code, resp
 
+#──────────────────────────────────────────────
+# Routes
+#──────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def root():
     return "TGIM Infallible online. Use POST /webhook."
@@ -123,5 +183,8 @@ def webhook():
     # ---- Any other mode is blocked (prevents accidental percent/lot paths) ----
     return jsonify(ok=False, error="unsupported_mode", hint="send mode:'units'"), 400
 
+#──────────────────────────────────────────────
+# Entrypoint
+#──────────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))
