@@ -1,4 +1,4 @@
-# TGIM OANDA Sync Webhook v2 — OANDA-only, old/new Pine compatible
+# TGIM OANDA Sync Webhook v3 — TV Safe ACK — OANDA-only, old/new Pine compatible
 # ------------------------------------------------------------------
 # Drop-in replacement for app.py on Render/Replit.
 # Keeps the same environment variables as the working app:
@@ -243,7 +243,7 @@ def flip_position(instrument: str, target: str, units: int) -> Tuple[int, Dict[s
 # ──────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def root():
-    return jsonify({"ok": True, "service": "TGIM OANDA Sync Webhook v2", "route": "/webhook"})
+    return jsonify({"ok": True, "service": "TGIM OANDA Sync Webhook v3 — TV Safe ACK", "route": "/webhook"})
 
 
 @app.route("/webhook", methods=["GET"])
@@ -274,42 +274,42 @@ def webhook():
         # Old format support: close_buy / close_sell
         if action == "close_buy":
             status, body = close_position(instrument, "long", ignore_if_flat=ignore_if_flat)
-            return ok_response({"ok": status < 300, "action": action, "instrument": instrument, "result": body}, 200 if status < 300 else status)
+            return ok_response({"ok": status < 300, "broker_status": status, "action": action, "instrument": instrument, "result": body}, 200)
 
         if action == "close_sell":
             status, body = close_position(instrument, "short", ignore_if_flat=ignore_if_flat)
-            return ok_response({"ok": status < 300, "action": action, "instrument": instrument, "result": body}, 200 if status < 300 else status)
+            return ok_response({"ok": status < 300, "broker_status": status, "action": action, "instrument": instrument, "result": body}, 200)
 
         # New format close: {action:"close", side:"long"/"short"}
         if action == "close":
             side = data.get("side") or data.get("target")
             status, body = close_position(instrument, str(side), ignore_if_flat=ignore_if_flat)
-            return ok_response({"ok": status < 300, "action": action, "instrument": instrument, "side": side, "result": body}, 200 if status < 300 else status)
+            return ok_response({"ok": status < 300, "broker_status": status, "action": action, "instrument": instrument, "side": side, "result": body}, 200)
 
         if action == "close_all":
             body = close_all(instrument, ignore_if_flat=ignore_if_flat)
-            return ok_response(body, 200 if body.get("ok") else 500)
+            return ok_response(body, 200)
 
         if action in {"buy", "sell"}:
             units = to_int_units(data.get("units"))
             status, body = synced_entry(action, instrument, units, policy=policy)
-            return ok_response(body, 200 if status < 300 else status)
+            return ok_response({**body, "broker_status": status}, 200)
 
         if action == "flip":
             units = to_int_units(data.get("units"))
             target = data.get("target") or data.get("side")
             status, body = flip_position(instrument, str(target), units)
-            return ok_response(body, 200 if status < 300 else status)
+            return ok_response({**body, "broker_status": status}, 200)
 
-        return ok_response({"ok": False, "error": "unsupported_action", "action": action, "supported": ["buy", "sell", "close_buy", "close_sell", "close", "close_all", "flip"]}, 400)
+        return ok_response({"ok": False, "error": "unsupported_action", "action": action, "supported": ["buy", "sell", "close_buy", "close_sell", "close", "close_all", "flip"]}, 200)
 
     except ValueError as e:
-        return ok_response({"ok": False, "error": str(e), "payload": data}, 400)
+        return ok_response({"ok": False, "error": str(e), "payload": data}, 200)
     except requests.RequestException as e:
-        return ok_response({"ok": False, "error": "oanda_request_exception", "detail": str(e)}, 502)
+        return ok_response({"ok": False, "error": "oanda_request_exception", "detail": str(e)}, 200)
     except Exception as e:
         app.logger.exception("Unhandled webhook error")
-        return ok_response({"ok": False, "error": "unhandled_exception", "detail": str(e)}, 500)
+        return ok_response({"ok": False, "error": "unhandled_exception", "detail": str(e)}, 200)
 
 
 if __name__ == "__main__":
