@@ -1,2 +1,1 @@
-OANDA_API_KEY=your_api_key_here
-OANDA_ACCOUNT_ID=your_account_id_here
+TGIM_FORCE_DYNAMIC_SIZING=true
