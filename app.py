@@ -1,59 +1,48 @@
-# TGIM OANDA Dynamic Margin Sizing Webhook v5
-# ------------------------------------------------------------------
-# Drop-in replacement for app.py on Render/Replit.
-# OANDA-only. Preserves strict no-hedge behavior and adds pair-by-pair
-# dynamic leverage/margin sizing from OANDA account instrument marginRate.
+# TGIM OANDA Dynamic Margin + Spread Webhook v7
+# ------------------------------------------------------------
+# Drop-in replacement for app.py on Render.
+# OANDA-only.
 #
-# Required environment variables:
+# Required Render environment variables:
 #   OANDA_ACCOUNT_ID
 #   OANDA_API_KEY
 #
-# Optional environment variables:
-#   OANDA_BASE_HOST=https://api-fxtrade.oanda.com      # live default
-#   OANDA_BASE_HOST=https://api-fxpractice.oanda.com   # practice
-#   TGIM_FORCE_DYNAMIC_SIZING=false                    # true = ignore payload units for buy/sell and use dynamic risk pct
-#   TGIM_DEFAULT_RISK_PCT=75                           # used when payload does not include risk_pct
-#   TGIM_MARGIN_SAFETY=0.95                            # cap target margin to 95% safety
-#   TGIM_ALLOW_ADD_SAME_SIDE=false                     # false = repeated buy while long / sell while short is ignored
-#   TGIM_MAX_UNITS=0                                   # 0 = no max cap; otherwise hard cap units
-#   TGIM_MARGIN_RETRY=2                                # reduce units and retry on margin rejection
-#
-# Best TradingView payload for dynamic sizing:
-#   {"action":"buy","instrument":"EUR_NZD","sizing_mode":"percent_equity","risk_pct":75,"position_policy":"sync"}
-#
-# Current units-only Pine payloads still work:
-#   {"action":"sell","instrument":"EUR_NZD","units":"1000","position_policy":"sync"}
-#
-# If your Pine still sends units only but you want app-side dynamic sizing,
-# set Render env var:
+# Optional Render environment variables:
+#   OANDA_BASE_HOST=https://api-fxtrade.oanda.com
 #   TGIM_FORCE_DYNAMIC_SIZING=true
+#   TGIM_DEFAULT_RISK_PCT=75
+#   TGIM_MARGIN_SAFETY=0.95
+#   TGIM_ALLOW_ADD_SAME_SIDE=false
+#   TGIM_MARGIN_RETRY=2
+#   TGIM_MAX_SPREAD_PIPS=0          # 0/off = do not block by spread
+#   TGIM_SPREAD_BUFFER_PIPS=0       # optional extra reserve in sizing math
 #
-# Main safety rules:
-#   1. Opposite side must close and verify before a new entry is placed.
-#   2. Same-side repeated entries are ignored by default to prevent duplicates.
-#   3. Dynamic units are calculated from live OANDA NAV, marginAvailable,
-#      instrument marginRate, and base-currency-to-home-currency conversion.
+# Main protections:
+#   1) No hedge: opposite side must close and verify before new side opens.
+#   2) No duplicate same-side stacking by default.
+#   3) Dynamic OANDA margin sizing per instrument using live marginRate.
+#   4) Live spread fetched from OANDA pricing endpoint and logged/returned.
+#   5) Optional max-spread blocker.
 
 from __future__ import annotations
 
 import json
 import os
 import time
-from decimal import Decimal, InvalidOperation, ROUND_FLOOR, ROUND_HALF_UP
-from functools import lru_cache
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP, getcontext
 from typing import Any, Dict, Optional, Tuple
 
 import requests
 from flask import Flask, jsonify, request
 
+getcontext().prec = 28
 app = Flask(__name__)
 
 # ──────────────────────────────────────────────
-# Environment Setup
+# Environment
 # ──────────────────────────────────────────────
 ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID", "").strip()
 API_KEY = os.environ.get("OANDA_API_KEY", "").strip()
-
 if not ACCOUNT_ID or not API_KEY:
     raise RuntimeError("Missing OANDA_ACCOUNT_ID or OANDA_API_KEY in environment.")
 
@@ -70,50 +59,26 @@ HEADERS = {
     "Authorization": f"Bearer {API_KEY}",
     "Content-Type": "application/json",
 }
-
 REQUEST_TIMEOUT = 20
 
-FORCE_DYNAMIC_SIZING = os.environ.get("TGIM_FORCE_DYNAMIC_SIZING", "false").strip().lower() in {"1", "true", "yes", "y", "on"}
+FORCE_DYNAMIC_SIZING = os.environ.get("TGIM_FORCE_DYNAMIC_SIZING", "false").strip().lower() == "true"
 DEFAULT_RISK_PCT = Decimal(os.environ.get("TGIM_DEFAULT_RISK_PCT", "75"))
 MARGIN_SAFETY = Decimal(os.environ.get("TGIM_MARGIN_SAFETY", "0.95"))
-ALLOW_ADD_SAME_SIDE = os.environ.get("TGIM_ALLOW_ADD_SAME_SIDE", "false").strip().lower() in {"1", "true", "yes", "y", "on"}
-MAX_UNITS = int(os.environ.get("TGIM_MAX_UNITS", "0") or "0")
-MARGIN_RETRY = int(os.environ.get("TGIM_MARGIN_RETRY", "2") or "0")
+ALLOW_ADD_SAME_SIDE = os.environ.get("TGIM_ALLOW_ADD_SAME_SIDE", "false").strip().lower() == "true"
+MARGIN_RETRY = int(os.environ.get("TGIM_MARGIN_RETRY", "2"))
+MAX_SPREAD_PIPS = Decimal(os.environ.get("TGIM_MAX_SPREAD_PIPS", "0"))
+SPREAD_BUFFER_PIPS = Decimal(os.environ.get("TGIM_SPREAD_BUFFER_PIPS", "0"))
 
 # ──────────────────────────────────────────────
 # Generic helpers
 # ──────────────────────────────────────────────
-def D(x: Any, default: str = "0") -> Decimal:
+def d(x: Any, default: str = "0") -> Decimal:
     try:
         if x is None or x == "":
             return Decimal(default)
         return Decimal(str(x))
     except (InvalidOperation, ValueError, TypeError):
         return Decimal(default)
-
-
-def normalize(sym: Any) -> str:
-    """Normalize common TradingView/OANDA symbols to OANDA format, e.g. EURNZD -> EUR_NZD."""
-    s = str(sym or "").upper().strip()
-    s = (
-        s.replace("OANDA:", "")
-        .replace("FX:", "")
-        .replace("FOREXCOM:", "")
-        .replace("IDC:", "")
-    )
-    s = s.replace(":", "").replace("-", "").replace("/", "").replace(" ", "")
-
-    special = {
-        "XAUUSD": "XAU_USD",
-        "XAGUSD": "XAG_USD",
-    }
-    if s in special:
-        return special[s]
-    if "_" in s:
-        return s
-    if len(s) == 6 and s.isalpha():
-        return f"{s[:3]}_{s[3:]}"
-    return s
 
 
 def parse_bool(val: Any, default: bool = False) -> bool:
@@ -124,24 +89,53 @@ def parse_bool(val: Any, default: bool = False) -> bool:
     return str(val).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def normalize(sym: Any) -> str:
+    s = str(sym or "").upper().strip()
+    s = (
+        s.replace("OANDA:", "")
+        .replace("FX:", "")
+        .replace("FOREXCOM:", "")
+        .replace("IDC:", "")
+    )
+    s = s.replace(":", "").replace("-", "").replace("/", "").replace(" ", "")
+    special = {"XAUUSD": "XAU_USD", "XAGUSD": "XAG_USD"}
+    if s in special:
+        return special[s]
+    if "_" in s:
+        return s
+    if len(s) == 6 and s.isalpha():
+        return f"{s[:3]}_{s[3:]}"
+    return s
+
+
+def instrument_parts(instrument: str) -> Tuple[str, str]:
+    parts = instrument.split("_")
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    return instrument[:3], instrument[-3:]
+
+
+def pip_size(instrument: str) -> Decimal:
+    # JPY pairs generally quote one pip as 0.01. Most FX pairs quote one pip as 0.0001.
+    _base, quote = instrument_parts(instrument)
+    if quote == "JPY":
+        return Decimal("0.01")
+    if instrument.startswith("XAU_") or instrument.startswith("XAG_"):
+        return Decimal("0.01")
+    return Decimal("0.0001")
+
+
 def to_int_units(val: Any) -> int:
-    """OANDA FX units are integer units."""
-    if val is None:
-        raise ValueError("units missing")
-    try:
-        q = Decimal(str(val)).to_integral_value(rounding=ROUND_HALF_UP)
-    except (InvalidOperation, ValueError, TypeError):
-        raise ValueError(f"units_not_int_castable: got={val!r}")
+    q = d(val, "0").to_integral_value(rounding=ROUND_HALF_UP)
     n = int(q)
     if n < 1:
         raise ValueError(f"units_must_be_positive_integer: got={val!r}")
     return n
 
 
-def floor_int(x: Decimal) -> int:
-    if x <= 0:
-        return 0
-    return int(x.to_integral_value(rounding=ROUND_FLOOR))
+def floor_units(val: Decimal) -> int:
+    n = int(val.to_integral_value(rounding=ROUND_DOWN))
+    return max(1, n)
 
 
 def response_json(response: requests.Response) -> Dict[str, Any]:
@@ -168,20 +162,16 @@ def log_oanda_response(tag: str, response: requests.Response) -> Dict[str, Any]:
             req_body = req_body.decode(errors="replace")
     except Exception:
         req_body = "<unavailable>"
-
     print(f"\n🔹 [{tag}] Status: {response.status_code}")
     print("🔸 URL:", response.url)
-    print("📦 Payload snippet:", str(req_body)[:1200])
-    print("📜 Response snippet:", json.dumps(body, ensure_ascii=False)[:2500])
+    print("📦 Payload snippet:", str(req_body)[:1500])
+    print("📜 Response snippet:", json.dumps(body, ensure_ascii=False)[:3000])
     print("──────────────────────────────────────────────\n")
     return body
 
 
 def tv_response(payload: Dict[str, Any], status: int = 200):
-    """
-    Return HTTP 200 to TradingView for broker rejects so alerts do not pause.
-    Malformed webhook payloads still return 400.
-    """
+    # Keep TradingView alerts from pausing on broker/account issues; details live in payload.ok/result.
     return jsonify(payload), status
 
 
@@ -189,236 +179,256 @@ def hard_error(payload: Dict[str, Any], status: int = 400):
     return jsonify(payload), status
 
 # ──────────────────────────────────────────────
-# OANDA read functions
+# OANDA read helpers
 # ──────────────────────────────────────────────
-def oanda_get(url: str, params: Optional[Dict[str, Any]] = None, tag: str = "OANDA-GET") -> Tuple[int, Dict[str, Any]]:
-    r = requests.get(url, headers=HEADERS, params=params, timeout=REQUEST_TIMEOUT)
-    body = log_oanda_response(tag, r)
+def get_account_summary() -> Tuple[int, Dict[str, Any]]:
+    r = requests.get(SUMMARY_URL, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+    body = log_oanda_response("OANDA-ACCOUNT-SUMMARY", r)
     return r.status_code, body
 
 
-def get_account_summary() -> Tuple[int, Dict[str, Any]]:
-    return oanda_get(SUMMARY_URL, tag="OANDA-ACCOUNT-SUMMARY")
-
-
-def get_open_positions_raw() -> Tuple[int, Dict[str, Any]]:
-    return oanda_get(OPEN_POSITIONS_URL, tag="OANDA-OPEN-POSITIONS")
-
-
-@lru_cache(maxsize=1)
-def get_account_instruments_cached() -> Dict[str, Any]:
-    status, body = oanda_get(INSTRUMENTS_URL, tag="OANDA-ACCOUNT-INSTRUMENTS")
+def get_account_snapshot() -> Tuple[int, Dict[str, Any]]:
+    status, body = get_account_summary()
     if status >= 300:
-        raise RuntimeError(f"Could not fetch OANDA instruments: {status} {body}")
-    by_name = {}
+        return status, {"ok": False, "error": "account_summary_failed", "body": body}
+    acct = body.get("account", {})
+    return status, {
+        "ok": True,
+        "currency": acct.get("currency", "USD"),
+        "NAV": str(acct.get("NAV", acct.get("balance", "0"))),
+        "balance": str(acct.get("balance", "0")),
+        "marginAvailable": str(acct.get("marginAvailable", "0")),
+        "marginUsed": str(acct.get("marginUsed", "0")),
+        "unrealizedPL": str(acct.get("unrealizedPL", "0")),
+        "raw": acct,
+    }
+
+
+def get_instruments_map() -> Tuple[int, Dict[str, Any]]:
+    r = requests.get(INSTRUMENTS_URL, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+    body = log_oanda_response("OANDA-INSTRUMENTS", r)
+    if r.status_code >= 300:
+        return r.status_code, {"ok": False, "body": body}
+    m = {}
     for inst in body.get("instruments", []):
         name = inst.get("name")
         if name:
-            by_name[name] = inst
-    return by_name
+            m[name] = inst
+    return r.status_code, {"ok": True, "instruments": m}
 
 
-def get_instrument_details(instrument: str) -> Dict[str, Any]:
-    instruments = get_account_instruments_cached()
-    inst = instruments.get(instrument)
+def get_instrument_details(instrument: str) -> Tuple[int, Dict[str, Any]]:
+    status, body = get_instruments_map()
+    if status >= 300 or not body.get("ok"):
+        return status, {"ok": False, "error": "instruments_lookup_failed", "body": body}
+    inst = body["instruments"].get(instrument)
     if not inst:
-        # Force a refresh once in case account instruments changed.
-        get_account_instruments_cached.cache_clear()
-        instruments = get_account_instruments_cached()
-        inst = instruments.get(instrument)
-    if not inst:
-        raise ValueError(f"instrument_not_available_for_account: {instrument}")
-    return inst
+        return 404, {"ok": False, "error": "instrument_not_found_for_account", "instrument": instrument}
+    margin_rate = d(inst.get("marginRate"), "0")
+    leverage = (Decimal("1") / margin_rate) if margin_rate > 0 else Decimal("0")
+    return 200, {
+        "ok": True,
+        "instrument": instrument,
+        "marginRate": str(margin_rate),
+        "impliedLeverage": str(leverage),
+        "pipLocation": inst.get("pipLocation"),
+        "displayPrecision": inst.get("displayPrecision"),
+        "tradeUnitsPrecision": inst.get("tradeUnitsPrecision"),
+        "minimumTradeSize": inst.get("minimumTradeSize"),
+        "raw": inst,
+    }
 
 
-def get_mid_price(instrument: str) -> Tuple[Optional[Decimal], Optional[Dict[str, Any]]]:
-    status, body = oanda_get(PRICING_URL, params={"instruments": instrument}, tag=f"OANDA-PRICING-{instrument}")
+def get_pricing(instruments: list[str]) -> Tuple[int, Dict[str, Any]]:
+    params = {"instruments": ",".join(instruments), "includeHomeConversions": "true"}
+    r = requests.get(PRICING_URL, headers=HEADERS, params=params, timeout=REQUEST_TIMEOUT)
+    body = log_oanda_response("OANDA-PRICING", r)
+    return r.status_code, body
+
+
+def best_bid_ask(price_obj: Dict[str, Any]) -> Tuple[Decimal, Decimal]:
+    bids = price_obj.get("bids") or []
+    asks = price_obj.get("asks") or []
+    bid = d(bids[0].get("price") if bids else price_obj.get("closeoutBid"), "0")
+    ask = d(asks[0].get("price") if asks else price_obj.get("closeoutAsk"), "0")
+    return bid, ask
+
+
+def extract_quote_to_home_conversion(price_obj: Dict[str, Any], quote_ccy: str, home_ccy: str) -> Decimal:
+    # Most reliable when includeHomeConversions=true. Different OANDA responses can expose conversion factors in slightly different shapes.
+    if quote_ccy == home_ccy:
+        return Decimal("1")
+    convs = price_obj.get("homeConversions") or []
+    for c in convs:
+        ccy = str(c.get("currency", "")).upper()
+        if ccy == quote_ccy:
+            # For margin reserve, use a conservative factor. Prefer positive ask, then bid, then factor.
+            for k in ("accountGain", "accountLoss", "positionValue", "ask", "bid", "factor"):
+                val = d(c.get(k), "0")
+                if val > 0:
+                    return val
+    return Decimal("1")
+
+
+def get_market_snapshot(instrument: str, account_currency: str = "USD") -> Tuple[int, Dict[str, Any]]:
+    status, body = get_pricing([instrument])
     if status >= 300:
-        return None, {"status": status, "body": body}
+        return status, {"ok": False, "error": "pricing_failed", "body": body}
     prices = body.get("prices") or []
     if not prices:
-        return None, {"status": status, "body": body, "error": "no_prices_returned"}
+        return 404, {"ok": False, "error": "no_price_returned", "instrument": instrument, "body": body}
     p = prices[0]
-
-    bid = D(p.get("closeoutBid"))
-    ask = D(p.get("closeoutAsk"))
-
-    # Fallback to top-of-book prices if closeoutBid/Ask are absent.
-    if bid <= 0:
-        bids = p.get("bids") or []
-        if bids:
-            bid = D(bids[0].get("price"))
-    if ask <= 0:
-        asks = p.get("asks") or []
-        if asks:
-            ask = D(asks[0].get("price"))
-
-    if bid > 0 and ask > 0:
-        return (bid + ask) / Decimal("2"), p
-    if bid > 0:
-        return bid, p
-    if ask > 0:
-        return ask, p
-    return None, {"status": status, "body": body, "error": "bad_price_fields"}
-
-
-def split_instrument(instrument: str) -> Tuple[str, str]:
-    if "_" not in instrument:
-        raise ValueError(f"cannot_split_instrument: {instrument}")
-    a, b = instrument.split("_", 1)
-    return a, b
+    bid, ask = best_bid_ask(p)
+    if bid <= 0 or ask <= 0:
+        return 409, {"ok": False, "error": "bad_bid_ask", "instrument": instrument, "price": p}
+    mid = (bid + ask) / Decimal("2")
+    spread_price = ask - bid
+    pip = pip_size(instrument)
+    spread_pips = spread_price / pip if pip > 0 else Decimal("0")
+    base, quote = instrument_parts(instrument)
+    quote_to_home = extract_quote_to_home_conversion(p, quote, str(account_currency or "USD").upper())
+    return 200, {
+        "ok": True,
+        "instrument": instrument,
+        "status": p.get("status"),
+        "tradeable": p.get("tradeable", p.get("status") == "tradeable"),
+        "time": p.get("time"),
+        "bid": str(bid),
+        "ask": str(ask),
+        "mid": str(mid),
+        "spread": str(spread_price),
+        "spreadPips": str(spread_pips),
+        "pipSize": str(pip),
+        "quoteCurrency": quote,
+        "accountCurrency": account_currency,
+        "quoteToHomeConversion": str(quote_to_home),
+        "raw": p,
+    }
 
 
-def conversion_factor_to_home(from_ccy: str, home_ccy: str) -> Tuple[Decimal, Dict[str, Any]]:
-    """
-    Returns how many home_ccy one unit of from_ccy is worth.
-    Example: from EUR to USD => EUR_USD mid price.
-    Example: from CAD to USD => 1 / USD_CAD mid price.
-    """
-    from_ccy = from_ccy.upper().strip()
-    home_ccy = home_ccy.upper().strip()
-    if from_ccy == home_ccy:
-        return Decimal("1"), {"method": "same_currency", "from": from_ccy, "home": home_ccy}
-
-    direct = normalize(f"{from_ccy}{home_ccy}")
-    inv = normalize(f"{home_ccy}{from_ccy}")
-
-    px, raw = get_mid_price(direct)
-    if px and px > 0:
-        return px, {"method": "direct", "instrument": direct, "price": str(px), "raw": raw}
-
-    px2, raw2 = get_mid_price(inv)
-    if px2 and px2 > 0:
-        return Decimal("1") / px2, {"method": "inverse", "instrument": inv, "price": str(px2), "factor": str(Decimal("1") / px2), "raw": raw2}
-
-    raise RuntimeError(f"conversion_unavailable: {from_ccy}_to_{home_ccy}; direct={direct} raw={raw}; inverse={inv} raw={raw2}")
+def get_open_positions_raw() -> Tuple[int, Dict[str, Any]]:
+    r = requests.get(OPEN_POSITIONS_URL, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+    body = log_oanda_response("OANDA-OPEN-POSITIONS", r)
+    return r.status_code, body
 
 
 def get_position(instrument: str) -> Tuple[bool, int, int, Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    """Returns: found, long_units, short_units_abs, raw_position, error"""
     status, body = get_open_positions_raw()
     if status >= 300:
         return False, 0, 0, None, {"status": status, "body": body}
-
     for pos in body.get("positions", []):
         if pos.get("instrument") == instrument:
-            long_units = int(D(pos.get("long", {}).get("units", "0")))
-            short_units_abs = int(abs(D(pos.get("short", {}).get("units", "0"))))
+            long_units = int(d(pos.get("long", {}).get("units", "0")))
+            short_units_abs = int(abs(d(pos.get("short", {}).get("units", "0"))))
             return True, long_units, short_units_abs, pos, None
-
     return False, 0, 0, None, None
 
 
 def snapshot_position(instrument: str) -> Dict[str, Any]:
     found, long_units, short_units_abs, raw, err = get_position(instrument)
-    return {
-        "instrument": instrument,
-        "found": found,
-        "long_units": long_units,
-        "short_units": short_units_abs,
-        "raw": raw,
-        "error": err,
-    }
+    return {"instrument": instrument, "found": found, "long_units": long_units, "short_units": short_units_abs, "raw": raw, "error": err}
 
 # ──────────────────────────────────────────────
-# Dynamic margin sizing
+# Dynamic sizing
 # ──────────────────────────────────────────────
-def should_use_dynamic_sizing(data: Dict[str, Any]) -> bool:
-    if FORCE_DYNAMIC_SIZING:
-        return True
-    mode = str(data.get("sizing_mode") or data.get("size_mode") or "").lower().strip()
-    if mode in {"percent_equity", "percent", "%_equity", "% of equity", "equity_pct", "dynamic"}:
-        return True
-    return False
+def dynamic_units_for_instrument(instrument: str, risk_pct: Decimal, side: str, max_spread_pips_override: Optional[Decimal] = None) -> Tuple[int, Dict[str, Any]]:
+    acct_status, acct = get_account_snapshot()
+    if acct_status >= 300 or not acct.get("ok"):
+        raise RuntimeError(f"account_snapshot_failed: {acct}")
+    account_ccy = acct.get("currency", "USD")
 
+    inst_status, inst = get_instrument_details(instrument)
+    if inst_status >= 300 or not inst.get("ok"):
+        raise RuntimeError(f"instrument_details_failed: {inst}")
 
-def dynamic_units(instrument: str, data: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
-    """
-    Calculates units from live OANDA account/instrument data:
-      target_margin = NAV * risk_pct
-      margin_per_unit = base_currency_to_home_currency * marginRate
-      units = target_margin / margin_per_unit
-    Capped by marginAvailable * safety.
-    """
-    summary_status, summary = get_account_summary()
-    if summary_status >= 300:
-        raise RuntimeError(f"account_summary_failed: {summary_status} {summary}")
+    mkt_status, mkt = get_market_snapshot(instrument, account_ccy)
+    if mkt_status >= 300 or not mkt.get("ok"):
+        raise RuntimeError(f"market_snapshot_failed: {mkt}")
 
-    acct = summary.get("account", {})
-    home_ccy = str(acct.get("currency") or "USD").upper()
-    nav = D(acct.get("NAV") or acct.get("balance"))
-    margin_available = D(acct.get("marginAvailable"), default=str(nav))
+    spread_pips = d(mkt.get("spreadPips"), "0")
+    effective_max_spread_pips = MAX_SPREAD_PIPS
+    if max_spread_pips_override is not None:
+        effective_max_spread_pips = max_spread_pips_override
 
-    risk_pct = D(data.get("risk_pct") or data.get("riskPct") or data.get("risk_percent") or DEFAULT_RISK_PCT)
-    if risk_pct <= 0:
-        raise ValueError(f"risk_pct_must_be_positive: {risk_pct}")
-    if risk_pct > 100:
-        # This app treats risk_pct as actual percent, not multiplier.
-        risk_pct = Decimal("100")
+    if effective_max_spread_pips > 0 and spread_pips > effective_max_spread_pips:
+        raise RuntimeError(f"spread_too_wide: spread_pips={spread_pips} max={effective_max_spread_pips}")
 
-    inst = get_instrument_details(instrument)
-    margin_rate = D(inst.get("marginRate"))
-    if margin_rate <= 0:
-        raise RuntimeError(f"missing_or_bad_marginRate_for_{instrument}: {inst}")
-    leverage = Decimal("1") / margin_rate
+    nav = d(acct.get("NAV"), "0")
+    margin_avail = d(acct.get("marginAvailable"), "0")
+    margin_rate = d(inst.get("marginRate"), "0")
+    quote_to_home = d(mkt.get("quoteToHomeConversion"), "1")
+    mid = d(mkt.get("mid"), "0")
+    pip = d(mkt.get("pipSize"), "0.0001")
 
-    base_ccy, quote_ccy = split_instrument(instrument)
-    base_to_home, conversion_info = conversion_factor_to_home(base_ccy, home_ccy)
-    if base_to_home <= 0:
-        raise RuntimeError(f"bad_base_to_home_conversion: {base_ccy}->{home_ccy} = {base_to_home}")
+    if nav <= 0 or margin_rate <= 0 or mid <= 0:
+        raise RuntimeError(f"bad_sizing_inputs: nav={nav} margin_rate={margin_rate} mid={mid}")
 
-    margin_per_unit = base_to_home * margin_rate
     target_margin = nav * (risk_pct / Decimal("100"))
-    available_cap_margin = margin_available * MARGIN_SAFETY
-    usable_margin = min(target_margin, available_cap_margin)
+    margin_cap = margin_avail * MARGIN_SAFETY
+    margin_to_use = min(target_margin, margin_cap) if margin_avail > 0 else target_margin
 
-    raw_units = usable_margin / margin_per_unit if margin_per_unit > 0 else Decimal("0")
-    units = floor_int(raw_units)
+    # OANDA margin approximation for account currency:
+    # units * mid price in quote currency * quote-to-home conversion * marginRate.
+    margin_per_unit = mid * quote_to_home * margin_rate
 
-    if MAX_UNITS > 0:
-        units = min(units, MAX_UNITS)
+    # Optional spread buffer reserve: units * spread_buffer_pips * pip * quote_to_home.
+    # This is intentionally conservative and small by default/off.
+    spread_buffer_per_unit = SPREAD_BUFFER_PIPS * pip * quote_to_home
+    cost_per_unit = margin_per_unit + spread_buffer_per_unit
+    if cost_per_unit <= 0:
+        raise RuntimeError(f"bad_cost_per_unit: {cost_per_unit}")
 
-    if units < 1:
-        raise ValueError(
-            f"dynamic_units_too_small: units={units}, nav={nav}, marginAvailable={margin_available}, "
-            f"risk_pct={risk_pct}, marginRate={margin_rate}, base_to_home={base_to_home}"
-        )
+    units_raw = margin_to_use / cost_per_unit
+    units = floor_units(units_raw)
 
-    details = {
-        "sizing_mode": "percent_equity_dynamic_oanda_margin",
+    return units, {
+        "mode": "dynamic_margin",
         "instrument": instrument,
-        "home_currency": home_ccy,
-        "base_currency": base_ccy,
-        "quote_currency": quote_ccy,
-        "nav": str(nav),
-        "margin_available": str(margin_available),
-        "risk_pct": str(risk_pct),
-        "margin_safety": str(MARGIN_SAFETY),
-        "target_margin": str(target_margin),
-        "available_cap_margin": str(available_cap_margin),
-        "usable_margin": str(usable_margin),
-        "instrument_margin_rate": str(margin_rate),
-        "implied_leverage": str(leverage),
-        "base_to_home": str(base_to_home),
-        "margin_per_unit": str(margin_per_unit),
-        "raw_units": str(raw_units),
-        "units": units,
-        "conversion_info": conversion_info,
+        "side": side,
+        "riskPct": str(risk_pct),
+        "NAV": str(nav),
+        "marginAvailable": str(margin_avail),
+        "marginSafety": str(MARGIN_SAFETY),
+        "targetMargin": str(target_margin),
+        "marginCap": str(margin_cap),
+        "marginToUse": str(margin_to_use),
+        "marginRate": str(margin_rate),
+        "impliedLeverage": inst.get("impliedLeverage"),
+        "bid": mkt.get("bid"),
+        "ask": mkt.get("ask"),
+        "mid": mkt.get("mid"),
+        "spread": mkt.get("spread"),
+        "spreadPips": mkt.get("spreadPips"),
+        "maxSpreadPipsEnv": str(MAX_SPREAD_PIPS),
+        "maxSpreadPipsPayload": str(max_spread_pips_override) if max_spread_pips_override is not None else None,
+        "maxSpreadPipsEffective": str(effective_max_spread_pips),
+        "pipSize": mkt.get("pipSize"),
+        "quoteToHomeConversion": str(quote_to_home),
+        "marginPerUnit": str(margin_per_unit),
+        "spreadBufferPips": str(SPREAD_BUFFER_PIPS),
+        "spreadBufferPerUnit": str(spread_buffer_per_unit),
+        "costPerUnit": str(cost_per_unit),
+        "unitsRaw": str(units_raw),
+        "finalUnits": units,
+        "account": acct,
+        "instrumentDetails": inst,
+        "market": mkt,
     }
-    log_event("DYNAMIC-SIZING", details)
-    return units, details
 
 
-def resolve_entry_units(instrument: str, data: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
-    if should_use_dynamic_sizing(data):
-        return dynamic_units(instrument, data)
-
-    # Payload/fixed units path. This preserves old Pine compatibility.
+def choose_units(data: Dict[str, Any], instrument: str, action: str) -> Tuple[int, Dict[str, Any]]:
+    sizing_mode = str(data.get("sizing_mode", data.get("sizingMode", ""))).lower().strip()
+    risk_pct = d(data.get("risk_pct", data.get("riskPct", DEFAULT_RISK_PCT)), str(DEFAULT_RISK_PCT))
+    max_spread_raw = data.get("max_spread_pips", data.get("maxSpreadPips", None))
+    max_spread_pips_override = None if max_spread_raw in (None, "") else d(max_spread_raw, "0")
+    use_dynamic = FORCE_DYNAMIC_SIZING or sizing_mode in {"percent_equity", "dynamic_margin", "margin", "account_percent"}
+    if use_dynamic:
+        return dynamic_units_for_instrument(instrument, risk_pct, action, max_spread_pips_override=max_spread_pips_override)
     units = to_int_units(data.get("units"))
-    return units, {"sizing_mode": "payload_units", "units": units}
+    return units, {"mode": "payload_units", "finalUnits": units, "payloadUnits": data.get("units")}
 
 # ──────────────────────────────────────────────
-# OANDA write functions
+# OANDA write helpers
 # ──────────────────────────────────────────────
 def place_market_order(instrument: str, signed_units: int) -> Tuple[int, Dict[str, Any]]:
     payload = {
@@ -435,44 +445,12 @@ def place_market_order(instrument: str, signed_units: int) -> Tuple[int, Dict[st
     return r.status_code, body
 
 
-def is_margin_reject(body: Dict[str, Any]) -> bool:
-    txt = json.dumps(body, ensure_ascii=False).upper()
-    return "MARGIN" in txt or "INSUFFICIENT" in txt or "UNITS_INVALID" in txt
-
-
-def place_market_order_with_retry(instrument: str, signed_units: int) -> Tuple[int, Dict[str, Any]]:
-    status, body = place_market_order(instrument, signed_units)
-    attempts = [{"units": signed_units, "status": status, "body": body}]
-    if status < 300:
-        return status, {"ok": True, "final_units": signed_units, "attempts": attempts}
-
-    # If dynamic sizing still hit broker margin limits, step down and retry.
-    units_abs = abs(int(signed_units))
-    side_mult = 1 if signed_units > 0 else -1
-    for i in range(max(0, MARGIN_RETRY)):
-        if not is_margin_reject(body):
-            break
-        units_abs = floor_int(Decimal(units_abs) * Decimal("0.90"))
-        if units_abs < 1:
-            break
-        retry_signed = side_mult * units_abs
-        status, body = place_market_order(instrument, retry_signed)
-        attempts.append({"units": retry_signed, "status": status, "body": body})
-        if status < 300:
-            return status, {"ok": True, "final_units": retry_signed, "attempts": attempts, "reduced_after_margin_reject": True}
-
-    return status, {"ok": False, "final_units": signed_units, "attempts": attempts}
-
-
 def close_position(instrument: str, side: str, ignore_if_flat: bool = True) -> Tuple[int, Dict[str, Any]]:
     side_norm = str(side or "").lower().strip()
-
     if side_norm in {"buy", "long", "close_buy"}:
-        human_side = "long"
-        close_field = "longUnits"
+        human_side, close_field = "long", "longUnits"
     elif side_norm in {"sell", "short", "close_sell"}:
-        human_side = "short"
-        close_field = "shortUnits"
+        human_side, close_field = "short", "shortUnits"
     else:
         return 400, {"ok": False, "error": "bad_close_side", "side": side}
 
@@ -481,195 +459,86 @@ def close_position(instrument: str, side: str, ignore_if_flat: bool = True) -> T
         return pos_err["status"], {"ok": False, "stage": "position_check_before_close", "error": pos_err}
 
     has_side = (human_side == "long" and long_units > 0) or (human_side == "short" and short_units_abs > 0)
-
     if not has_side:
         if ignore_if_flat:
-            return 200, {
-                "ok": True,
-                "ignored": True,
-                "reason": "already_flat_or_no_matching_side",
-                "instrument": instrument,
-                "side": human_side,
-                "long_units": long_units,
-                "short_units": short_units_abs,
-            }
-        return 409, {
-            "ok": False,
-            "error": "no_matching_position_to_close",
-            "instrument": instrument,
-            "side": human_side,
-            "long_units": long_units,
-            "short_units": short_units_abs,
-        }
+            return 200, {"ok": True, "ignored": True, "reason": "already_flat_or_no_matching_side", "instrument": instrument, "side": human_side, "long_units": long_units, "short_units": short_units_abs}
+        return 409, {"ok": False, "error": "no_matching_position_to_close", "instrument": instrument, "side": human_side, "long_units": long_units, "short_units": short_units_abs}
 
-    payload = {close_field: "ALL"}
     url = f"{POSITIONS_URL}/{instrument}/close"
+    payload = {close_field: "ALL"}
     r = requests.put(url, headers=HEADERS, json=payload, timeout=REQUEST_TIMEOUT)
     body = log_oanda_response(f"OANDA-CLOSE-{human_side.upper()}", r)
-
     if r.status_code >= 300:
         return r.status_code, {"ok": False, "stage": "close_position", "oanda": body}
 
-    # Verify close actually removed the side.
     time.sleep(0.15)
     found2, long2, short2, raw2, err2 = get_position(instrument)
     if err2:
         return err2["status"], {"ok": False, "stage": "verify_close", "error": err2, "close_response": body}
-
     still_open = (human_side == "long" and long2 > 0) or (human_side == "short" and short2 > 0)
     if still_open:
-        return 409, {
-            "ok": False,
-            "stage": "verify_close",
-            "error": "side_still_open_after_close",
-            "instrument": instrument,
-            "side": human_side,
-            "long_units": long2,
-            "short_units": short2,
-            "close_response": body,
-            "position_after_close": raw2,
-        }
+        return 409, {"ok": False, "stage": "verify_close", "error": "side_still_open_after_close", "instrument": instrument, "side": human_side, "long_units": long2, "short_units": short2, "close_response": body, "position_after_close": raw2}
 
-    return 200, {
-        "ok": True,
-        "instrument": instrument,
-        "side": human_side,
-        "closed": True,
-        "oanda": body,
-        "position_after_close": {"found": found2, "long_units": long2, "short_units": short2},
-    }
+    return 200, {"ok": True, "instrument": instrument, "side": human_side, "closed": True, "oanda": body, "position_after_close": {"found": found2, "long_units": long2, "short_units": short2}}
 
 
-def close_all(instrument: str, ignore_if_flat: bool = True) -> Dict[str, Any]:
-    long_status, long_body = close_position(instrument, "long", ignore_if_flat=ignore_if_flat)
-    short_status, short_body = close_position(instrument, "short", ignore_if_flat=ignore_if_flat)
-    ok = long_status < 300 and short_status < 300
-    return {
-        "ok": ok,
-        "instrument": instrument,
-        "long_close": {"broker_status": long_status, "body": long_body},
-        "short_close": {"broker_status": short_status, "body": short_body},
-    }
-
-
-def strict_synced_entry(action: str, instrument: str, units: int, sizing_details: Dict[str, Any], policy: str = "sync", allow_add_same_side: bool = ALLOW_ADD_SAME_SIDE) -> Tuple[int, Dict[str, Any]]:
-    """
-    No-hedge entry.
-    If opposite side exists, it must close and verify before new order is placed.
-    If same side exists, ignore by default to avoid duplicate stacking.
-    """
+def strict_synced_entry(action: str, instrument: str, units: int, sizing: Dict[str, Any], policy: str = "sync") -> Tuple[int, Dict[str, Any]]:
     action_norm = str(action or "").lower().strip()
     if action_norm not in {"buy", "sell"}:
         return 400, {"ok": False, "error": "bad_entry_action", "action": action}
 
     before = snapshot_position(instrument)
     if before.get("error"):
-        return before["error"]["status"], {"ok": False, "stage": "pre_entry_position_check", "position": before}
+        return before["error"]["status"], {"ok": False, "stage": "pre_entry_position_check", "position": before, "sizing": sizing}
 
     opposite_side = "short" if action_norm == "buy" else "long"
     same_side = "long" if action_norm == "buy" else "short"
     opposite_units = before["short_units"] if action_norm == "buy" else before["long_units"]
     same_units = before["long_units"] if action_norm == "buy" else before["short_units"]
 
-    if same_units > 0 and opposite_units == 0 and not allow_add_same_side:
-        return 200, {
-            "ok": True,
-            "ignored": True,
-            "reason": "already_in_same_side_no_duplicate_added",
-            "action_requested": action_norm,
-            "instrument": instrument,
-            "same_side": same_side,
-            "same_units_existing": same_units,
-            "units_requested": units,
-            "sizing": sizing_details,
-            "position_before": before,
-        }
+    if same_units > 0 and not ALLOW_ADD_SAME_SIDE:
+        return 200, {"ok": True, "ignored": True, "reason": "same_side_position_already_open_no_stacking", "action_requested": action_norm, "instrument": instrument, "same_side": same_side, "same_units_before": same_units, "position_before": before, "sizing": sizing}
 
     close_status = None
     close_body = None
-
     if str(policy or "sync").lower().strip() == "sync" and opposite_units > 0:
         close_status, close_body = close_position(instrument, opposite_side, ignore_if_flat=False)
         if close_status >= 300 or not close_body.get("ok", False):
-            return 409, {
-                "ok": False,
-                "blocked_new_entry": True,
-                "reason": "opposite_close_failed_no_hedge_enforced",
-                "action_requested": action_norm,
-                "instrument": instrument,
-                "units_requested": units,
-                "sizing": sizing_details,
-                "opposite_side": opposite_side,
-                "opposite_units_before": opposite_units,
-                "position_before": before,
-                "close_attempt": {"broker_status": close_status, "body": close_body},
-            }
+            return 409, {"ok": False, "blocked_new_entry": True, "reason": "opposite_close_failed_no_hedge_enforced", "action_requested": action_norm, "instrument": instrument, "units_requested": units, "opposite_side": opposite_side, "opposite_units_before": opposite_units, "position_before": before, "close_attempt": {"broker_status": close_status, "body": close_body}, "sizing": sizing}
 
-    # Re-check immediately before entry.
     verified = snapshot_position(instrument)
     if verified.get("error"):
-        return verified["error"]["status"], {"ok": False, "stage": "verify_before_entry", "position": verified}
-
+        return verified["error"]["status"], {"ok": False, "stage": "verify_before_entry", "position": verified, "sizing": sizing}
     verified_opposite_units = verified["short_units"] if action_norm == "buy" else verified["long_units"]
-    verified_same_units = verified["long_units"] if action_norm == "buy" else verified["short_units"]
-
     if verified_opposite_units > 0:
-        return 409, {
-            "ok": False,
-            "blocked_new_entry": True,
-            "reason": "opposite_position_still_exists_before_entry",
-            "action_requested": action_norm,
-            "instrument": instrument,
-            "opposite_side": opposite_side,
-            "opposite_units": verified_opposite_units,
-            "position_before": before,
-            "position_verified": verified,
-            "close_attempt": {"broker_status": close_status, "body": close_body},
-        }
-
-    if verified_same_units > 0 and not allow_add_same_side:
-        return 200, {
-            "ok": True,
-            "ignored": True,
-            "reason": "already_in_same_side_after_sync_no_duplicate_added",
-            "action_requested": action_norm,
-            "instrument": instrument,
-            "same_side": same_side,
-            "same_units_existing": verified_same_units,
-            "units_requested": units,
-            "sizing": sizing_details,
-            "position_before": before,
-            "position_verified": verified,
-        }
+        return 409, {"ok": False, "blocked_new_entry": True, "reason": "opposite_position_still_exists_before_entry", "action_requested": action_norm, "instrument": instrument, "opposite_side": opposite_side, "opposite_units": verified_opposite_units, "position_before": before, "position_verified": verified, "close_attempt": {"broker_status": close_status, "body": close_body}, "sizing": sizing}
 
     signed_units = units if action_norm == "buy" else -units
-    order_status, order_body = place_market_order_with_retry(instrument, signed_units)
+    order_status, order_body = place_market_order(instrument, signed_units)
+
+    # Retry margin rejection with smaller units.
+    attempts = [{"units": signed_units, "broker_status": order_status, "body": order_body}]
+    retry_units = abs(signed_units)
+    retries_left = max(0, MARGIN_RETRY)
+    while order_status >= 300 and retries_left > 0 and retry_units > 1:
+        txt = json.dumps(order_body).lower()
+        if "margin" not in txt and "insufficient" not in txt:
+            break
+        retry_units = max(1, int(Decimal(retry_units) * Decimal("0.90")))
+        signed_retry = retry_units if action_norm == "buy" else -retry_units
+        order_status, order_body = place_market_order(instrument, signed_retry)
+        attempts.append({"units": signed_retry, "broker_status": order_status, "body": order_body})
+        retries_left -= 1
+        signed_units = signed_retry
 
     after = snapshot_position(instrument)
-
-    return order_status, {
-        "ok": order_status < 300,
-        "action": action_norm,
-        "instrument": instrument,
-        "units_requested": signed_units,
-        "units_final": order_body.get("final_units", signed_units),
-        "policy": policy,
-        "same_side": same_side,
-        "sizing": sizing_details,
-        "position_before": before,
-        "opposite_close": {"broker_status": close_status, "body": close_body},
-        "order": {"broker_status": order_status, "body": order_body},
-        "position_after": after,
-    }
+    return order_status, {"ok": order_status < 300, "action": action_norm, "instrument": instrument, "units": signed_units, "policy": policy, "position_before": before, "opposite_close": {"broker_status": close_status, "body": close_body}, "order_attempts": attempts, "order": {"broker_status": order_status, "body": order_body}, "position_after": after, "sizing": sizing}
 
 
-def flip_position(instrument: str, target: str, units: int, sizing_details: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
-    target_norm = str(target or "").lower().strip()
-    if target_norm in {"buy", "long"}:
-        return strict_synced_entry("buy", instrument, units, sizing_details, policy="sync")
-    if target_norm in {"sell", "short"}:
-        return strict_synced_entry("sell", instrument, units, sizing_details, policy="sync")
-    return 400, {"ok": False, "error": "bad_flip_target", "target": target}
+def close_all(instrument: str, ignore_if_flat: bool = True) -> Dict[str, Any]:
+    long_status, long_body = close_position(instrument, "long", ignore_if_flat=ignore_if_flat)
+    short_status, short_body = close_position(instrument, "short", ignore_if_flat=ignore_if_flat)
+    return {"ok": long_status < 300 and short_status < 300, "instrument": instrument, "long_close": {"broker_status": long_status, "body": long_body}, "short_close": {"broker_status": short_status, "body": short_body}}
 
 # ──────────────────────────────────────────────
 # Routes
@@ -678,26 +547,42 @@ def flip_position(instrument: str, target: str, units: int, sizing_details: Dict
 def root():
     return jsonify({
         "ok": True,
-        "service": "TGIM OANDA Dynamic Margin Sizing Webhook v5",
+        "service": "TGIM OANDA Dynamic Margin + Spread Webhook v7",
         "route": "/webhook",
-        "no_hedge_enforced": True,
         "dynamic_margin_sizing": True,
         "force_dynamic_sizing": FORCE_DYNAMIC_SIZING,
         "default_risk_pct": str(DEFAULT_RISK_PCT),
         "margin_safety": str(MARGIN_SAFETY),
+        "max_spread_pips_env": str(MAX_SPREAD_PIPS),
+        "max_spread_payload_override": True,
+        "spread_buffer_pips": str(SPREAD_BUFFER_PIPS),
+        "no_hedge_enforced": True,
     })
 
 
 @app.route("/webhook", methods=["GET", "HEAD"])
 def webhook_get():
-    return jsonify({
-        "ok": True,
-        "route": "/webhook",
-        "expect": "POST JSON",
-        "no_hedge_enforced": True,
-        "dynamic_margin_sizing": True,
-        "force_dynamic_sizing": FORCE_DYNAMIC_SIZING,
-    })
+    return jsonify({"ok": True, "route": "/webhook", "expect": "POST JSON", "service": "v7", "spread_endpoint": "/spread/<instrument>"})
+
+
+@app.route("/spread/<instrument>", methods=["GET"])
+def spread_route(instrument: str):
+    inst = normalize(instrument)
+    acct_status, acct = get_account_snapshot()
+    acct_ccy = acct.get("currency", "USD") if acct_status < 300 and acct.get("ok") else "USD"
+    status, snap = get_market_snapshot(inst, acct_ccy)
+    return tv_response({"ok": status < 300, "instrument": inst, "broker_status": status, "spread": snap}, 200)
+
+
+@app.route("/status/<instrument>", methods=["GET"])
+def status_route(instrument: str):
+    inst = normalize(instrument)
+    acct_status, acct = get_account_snapshot()
+    acct_ccy = acct.get("currency", "USD") if acct_status < 300 and acct.get("ok") else "USD"
+    mkt_status, mkt = get_market_snapshot(inst, acct_ccy)
+    inst_status, details = get_instrument_details(inst)
+    pos = snapshot_position(inst)
+    return tv_response({"ok": True, "instrument": inst, "account": acct, "instrumentDetails": details, "market": mkt, "position": pos})
 
 
 @app.route("/webhook", methods=["POST"])
@@ -705,7 +590,6 @@ def webhook():
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return hard_error({"ok": False, "error": "expected_json_object"}, 400)
-
     log_event("TRADINGVIEW-PAYLOAD", data)
 
     action = str(data.get("action", "")).lower().strip()
@@ -713,7 +597,6 @@ def webhook():
     instrument = normalize(raw_instrument)
     ignore_if_flat = parse_bool(data.get("ignore_if_flat"), default=True)
     policy = str(data.get("position_policy", "sync")).lower().strip()
-    allow_add = parse_bool(data.get("allow_add_same_side"), default=ALLOW_ADD_SAME_SIDE)
 
     if not action:
         return hard_error({"ok": False, "error": "missing_action", "payload": data}, 400)
@@ -721,26 +604,20 @@ def webhook():
         return hard_error({"ok": False, "error": "missing_instrument", "payload": data}, 400)
 
     try:
-        # Diagnostics/status
         if action == "status":
+            acct_status, acct = get_account_snapshot()
+            acct_ccy = acct.get("currency", "USD") if acct_status < 300 and acct.get("ok") else "USD"
+            mkt_status, mkt = get_market_snapshot(instrument, acct_ccy)
+            details_status, details = get_instrument_details(instrument)
             pos = snapshot_position(instrument)
-            inst = get_instrument_details(instrument)
-            sizing_preview = None
-            try:
-                preview_units, preview = dynamic_units(instrument, data)
-                sizing_preview = preview
-            except Exception as e:
-                sizing_preview = {"ok": False, "error": str(e)}
-            return tv_response({
-                "ok": not bool(pos.get("error")),
-                "action": action,
-                "instrument": instrument,
-                "position": pos,
-                "instrument_details": inst,
-                "dynamic_sizing_preview": sizing_preview,
-            })
+            return tv_response({"ok": True, "action": action, "instrument": instrument, "account": acct, "instrumentDetails": details, "market": mkt, "position": pos})
 
-        # Legacy close formats
+        if action == "spread":
+            acct_status, acct = get_account_snapshot()
+            acct_ccy = acct.get("currency", "USD") if acct_status < 300 and acct.get("ok") else "USD"
+            mkt_status, mkt = get_market_snapshot(instrument, acct_ccy)
+            return tv_response({"ok": mkt_status < 300, "action": action, "instrument": instrument, "broker_status": mkt_status, "spread": mkt})
+
         if action == "close_buy":
             status, body = close_position(instrument, "long", ignore_if_flat=ignore_if_flat)
             return tv_response({"ok": status < 300, "action": action, "instrument": instrument, "broker_status": status, "result": body})
@@ -758,24 +635,24 @@ def webhook():
             body = close_all(instrument, ignore_if_flat=ignore_if_flat)
             return tv_response({"ok": body.get("ok", False), "action": action, "instrument": instrument, "result": body})
 
-        # Strict no-hedge entries with optional dynamic margin sizing
         if action in {"buy", "sell"}:
-            units, sizing_details = resolve_entry_units(instrument, data)
-            status, body = strict_synced_entry(action, instrument, units, sizing_details, policy=policy, allow_add_same_side=allow_add)
+            units, sizing = choose_units(data, instrument, action)
+            status, body = strict_synced_entry(action, instrument, units, sizing, policy=policy)
             return tv_response({"ok": status < 300 and body.get("ok", False), "action": action, "instrument": instrument, "broker_status": status, "result": body})
 
         if action == "flip":
-            target = data.get("target") or data.get("side")
-            units, sizing_details = resolve_entry_units(instrument, data)
-            status, body = flip_position(instrument, str(target), units, sizing_details)
+            target = str(data.get("target") or data.get("side") or "").lower().strip()
+            if target in {"buy", "long"}:
+                units, sizing = choose_units({**data, "action": "buy"}, instrument, "buy")
+                status, body = strict_synced_entry("buy", instrument, units, sizing, policy="sync")
+            elif target in {"sell", "short"}:
+                units, sizing = choose_units({**data, "action": "sell"}, instrument, "sell")
+                status, body = strict_synced_entry("sell", instrument, units, sizing, policy="sync")
+            else:
+                return hard_error({"ok": False, "error": "bad_flip_target", "target": target}, 400)
             return tv_response({"ok": status < 300 and body.get("ok", False), "action": action, "instrument": instrument, "target": target, "broker_status": status, "result": body})
 
-        return hard_error({
-            "ok": False,
-            "error": "unsupported_action",
-            "action": action,
-            "supported": ["buy", "sell", "close_buy", "close_sell", "close", "close_all", "flip", "status"],
-        }, 400)
+        return hard_error({"ok": False, "error": "unsupported_action", "action": action}, 400)
 
     except ValueError as e:
         return hard_error({"ok": False, "error": str(e), "payload": data}, 400)
