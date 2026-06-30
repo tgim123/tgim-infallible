@@ -1,4 +1,4 @@
-# TGIM OANDA Dynamic Margin + Spread Webhook v7
+# TGIM OANDA Dynamic Margin + Spread Webhook v7.1 — Spread Lock
 # ------------------------------------------------------------
 # Drop-in replacement for app.py on Render.
 # OANDA-only.
@@ -14,7 +14,7 @@
 #   TGIM_MARGIN_SAFETY=0.95
 #   TGIM_ALLOW_ADD_SAME_SIDE=false
 #   TGIM_MARGIN_RETRY=2
-#   TGIM_MAX_SPREAD_PIPS=0          # 0/off = do not block by spread
+#   TGIM_MAX_SPREAD_PIPS=4          # hard block new entries/flips when live spread is > this value; 0/off disables
 #   TGIM_SPREAD_BUFFER_PIPS=0       # optional extra reserve in sizing math
 #
 # Main protections:
@@ -66,7 +66,7 @@ DEFAULT_RISK_PCT = Decimal(os.environ.get("TGIM_DEFAULT_RISK_PCT", "75"))
 MARGIN_SAFETY = Decimal(os.environ.get("TGIM_MARGIN_SAFETY", "0.95"))
 ALLOW_ADD_SAME_SIDE = os.environ.get("TGIM_ALLOW_ADD_SAME_SIDE", "false").strip().lower() == "true"
 MARGIN_RETRY = int(os.environ.get("TGIM_MARGIN_RETRY", "2"))
-MAX_SPREAD_PIPS = Decimal(os.environ.get("TGIM_MAX_SPREAD_PIPS", "0"))
+MAX_SPREAD_PIPS = Decimal(os.environ.get("TGIM_MAX_SPREAD_PIPS", "4"))
 SPREAD_BUFFER_PIPS = Decimal(os.environ.get("TGIM_SPREAD_BUFFER_PIPS", "0"))
 
 # ──────────────────────────────────────────────
@@ -427,6 +427,26 @@ def choose_units(data: Dict[str, Any], instrument: str, action: str) -> Tuple[in
     units = to_int_units(data.get("units"))
     return units, {"mode": "payload_units", "finalUnits": units, "payloadUnits": data.get("units")}
 
+
+def enforce_entry_spread_guard(data: Dict[str, Any], instrument: str) -> Dict[str, Any]:
+    """Hard broker-side entry/flip spread lock.
+
+    This runs before opening any new position, even when fixed units are used.
+    Close actions intentionally bypass it so the bot can always reduce/flatten risk.
+    Payload max_spread_pips overrides the Render env value when supplied.
+    """
+    max_spread_raw = data.get("max_spread_pips", data.get("maxSpreadPips", None))
+    effective_max = MAX_SPREAD_PIPS if max_spread_raw in (None, "") else d(max_spread_raw, "0")
+    acct_status, acct = get_account_snapshot()
+    acct_ccy = acct.get("currency", "USD") if acct_status < 300 and acct.get("ok") else "USD"
+    mkt_status, mkt = get_market_snapshot(instrument, acct_ccy)
+    if mkt_status >= 300 or not mkt.get("ok"):
+        return {"ok": False, "blocked": True, "reason": "spread_check_failed", "broker_status": mkt_status, "maxSpreadPipsEffective": str(effective_max), "market": mkt}
+    spread_pips = d(mkt.get("spreadPips"), "0")
+    if effective_max > 0 and spread_pips > effective_max:
+        return {"ok": False, "blocked": True, "reason": "spread_too_wide", "spreadPips": str(spread_pips), "maxSpreadPipsEffective": str(effective_max), "market": mkt}
+    return {"ok": True, "blocked": False, "spreadPips": str(spread_pips), "maxSpreadPipsEffective": str(effective_max), "market": mkt}
+
 # ──────────────────────────────────────────────
 # OANDA write helpers
 # ──────────────────────────────────────────────
@@ -547,7 +567,7 @@ def close_all(instrument: str, ignore_if_flat: bool = True) -> Dict[str, Any]:
 def root():
     return jsonify({
         "ok": True,
-        "service": "TGIM OANDA Dynamic Margin + Spread Webhook v7",
+        "service": "TGIM OANDA Dynamic Margin + Spread Webhook v7.1 — Spread Lock",
         "route": "/webhook",
         "dynamic_margin_sizing": True,
         "force_dynamic_sizing": FORCE_DYNAMIC_SIZING,
@@ -555,6 +575,7 @@ def root():
         "margin_safety": str(MARGIN_SAFETY),
         "max_spread_pips_env": str(MAX_SPREAD_PIPS),
         "max_spread_payload_override": True,
+        "hard_entry_spread_lock": True,
         "spread_buffer_pips": str(SPREAD_BUFFER_PIPS),
         "no_hedge_enforced": True,
     })
@@ -562,7 +583,7 @@ def root():
 
 @app.route("/webhook", methods=["GET", "HEAD"])
 def webhook_get():
-    return jsonify({"ok": True, "route": "/webhook", "expect": "POST JSON", "service": "v7", "spread_endpoint": "/spread/<instrument>"})
+    return jsonify({"ok": True, "route": "/webhook", "expect": "POST JSON", "service": "v7.1", "spread_endpoint": "/spread/<instrument>"})
 
 
 @app.route("/spread/<instrument>", methods=["GET"])
@@ -636,17 +657,31 @@ def webhook():
             return tv_response({"ok": body.get("ok", False), "action": action, "instrument": instrument, "result": body})
 
         if action in {"buy", "sell"}:
+            spread_guard = enforce_entry_spread_guard(data, instrument)
+            if not spread_guard.get("ok", False):
+                return tv_response({"ok": False, "action": action, "instrument": instrument, "blocked_new_entry": True, "result": spread_guard})
             units, sizing = choose_units(data, instrument, action)
+            sizing["entrySpreadGuard"] = spread_guard
             status, body = strict_synced_entry(action, instrument, units, sizing, policy=policy)
             return tv_response({"ok": status < 300 and body.get("ok", False), "action": action, "instrument": instrument, "broker_status": status, "result": body})
 
         if action == "flip":
             target = str(data.get("target") or data.get("side") or "").lower().strip()
             if target in {"buy", "long"}:
-                units, sizing = choose_units({**data, "action": "buy"}, instrument, "buy")
+                entry_payload = {**data, "action": "buy"}
+                spread_guard = enforce_entry_spread_guard(entry_payload, instrument)
+                if not spread_guard.get("ok", False):
+                    return tv_response({"ok": False, "action": action, "instrument": instrument, "target": target, "blocked_new_entry": True, "result": spread_guard})
+                units, sizing = choose_units(entry_payload, instrument, "buy")
+                sizing["entrySpreadGuard"] = spread_guard
                 status, body = strict_synced_entry("buy", instrument, units, sizing, policy="sync")
             elif target in {"sell", "short"}:
-                units, sizing = choose_units({**data, "action": "sell"}, instrument, "sell")
+                entry_payload = {**data, "action": "sell"}
+                spread_guard = enforce_entry_spread_guard(entry_payload, instrument)
+                if not spread_guard.get("ok", False):
+                    return tv_response({"ok": False, "action": action, "instrument": instrument, "target": target, "blocked_new_entry": True, "result": spread_guard})
+                units, sizing = choose_units(entry_payload, instrument, "sell")
+                sizing["entrySpreadGuard"] = spread_guard
                 status, body = strict_synced_entry("sell", instrument, units, sizing, policy="sync")
             else:
                 return hard_error({"ok": False, "error": "bad_flip_target", "target": target}, 400)
