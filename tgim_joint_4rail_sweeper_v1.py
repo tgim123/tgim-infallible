@@ -1,878 +1,1021 @@
-# TGIM OANDA Dynamic Margin + Spread Webhook v7.2 — Portfolio Slot + Rollover Lock
-# ------------------------------------------------------------
-# Drop-in replacement for app.py on Render.
-# OANDA-only.
-#
-# Required Render environment variables:
-#   OANDA_ACCOUNT_ID
-#   OANDA_API_KEY
-#
-# Optional Render environment variables:
-#   OANDA_BASE_HOST=https://api-fxtrade.oanda.com
-#   TGIM_FORCE_DYNAMIC_SIZING=true
-#   TGIM_DEFAULT_RISK_PCT=75
-#   TGIM_MARGIN_SAFETY=0.95
-#   TGIM_ALLOW_ADD_SAME_SIDE=false
-#   TGIM_MARGIN_RETRY=2
-#   TGIM_MAX_SPREAD_PIPS=4          # hard block new entries/flips when live spread is > this value; 0/off disables
-#   TGIM_SPREAD_BUFFER_PIPS=0       # optional extra reserve in sizing math
-#   TGIM_PORTFOLIO_SLOT_MODE=true
-#   TGIM_MAX_PORTFOLIO_MARGIN_PCT=30
-#   TGIM_MAX_CONCURRENT_POSITIONS=3
-#   TGIM_BLOCK_NY_5PM_HOUR=true
-#   TGIM_RESPECT_PAYLOAD_RISK_PCT_IN_SLOT_MODE=false
-#
-# Main protections:
-#   1) No hedge: opposite side must close and verify before new side opens.
-#   2) No duplicate same-side stacking by default.
-#   3) Dynamic OANDA margin sizing per instrument using live marginRate.
-#   4) Live spread fetched from OANDA pricing endpoint and logged/returned.
-#   5) Optional max-spread blocker.
+#!/usr/bin/env python3
+"""
+TGIM Joint 4-Rail Sweeper v1
+============================
+
+Purpose
+-------
+Search the FOUR-RAIL ORGANISM, not one rail at a time.
+
+Fixed timeframe bays:
+    R2  = 1D
+    R8  = 15m
+    R9  = 5m
+    R10 = 1m
+
+RAW only. ADX/DI gates OFF during this search.
+
+Each bay varies:
+    Rail family: EMA / HMA / KS / WMA
+    Length:      5 / 8 / 13 / 21 / 27 / 34
+
+Coarse Cartesian search:
+    24 x 24 x 24 x 24 = 331,776 complete four-rail systems.
+
+Current production control:
+    R2  = EMA 5 RAW
+    R8  = HMA 27 RAW
+    R9  = KS 27 RAW
+    R10 = KS 27 RAW
+
+The search is BASELINE-GATED. By default the script refuses to rank candidates
+when its production-control result does not match the expected TradingView total
+trade count for the selected 50SET pair.
+
+Historical engine ported for this RAW / One-Leg-Only research phase:
+- OANDA candle data
+- TradingView/OANDA Daily chart as the execution clock
+- source-timeframe HMA/WMA/KS(ta.linreg)/EMA rail math
+- raw rail/inverse turn detection
+- global 27-turn R registry
+- clutter averaging OFF
+- Any Route R previous-opposite target
+- R2 Trigger direction + R8 Guardian direction
+- one open trade at a time
+- new-ray entries only
+- entry fills next Daily bar open
+- target exits when Daily realClose reaches/crosses the stored target
+- no Guardian exit while a trade is open
+- one-leg-only cooldown after target payment
+- normalized pips / MAE / duration metrics
+
+This is a research accelerator. TradingView remains the final verifier.
+"""
 
 from __future__ import annotations
 
+import argparse
+import itertools
 import json
+import math
 import os
+import sys
 import time
-import threading
-from zoneinfo import ZoneInfo
-from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP, getcontext
-from typing import Any, Dict, Optional, Tuple
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Dict, List, Tuple
 
+import numpy as np
+import pandas as pd
 import requests
-from flask import Flask, jsonify, request
 
-getcontext().prec = 28
-app = Flask(__name__)
-
-# ──────────────────────────────────────────────
-# Environment
-# ──────────────────────────────────────────────
-ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID", "").strip()
-API_KEY = os.environ.get("OANDA_API_KEY", "").strip()
-if not ACCOUNT_ID or not API_KEY:
-    raise RuntimeError("Missing OANDA_ACCOUNT_ID or OANDA_API_KEY in environment.")
-
-BASE_HOST = os.environ.get("OANDA_BASE_HOST", "https://api-fxtrade.oanda.com").strip().rstrip("/")
-BASE_URL = f"{BASE_HOST}/v3/accounts/{ACCOUNT_ID}"
-ORDERS_URL = f"{BASE_URL}/orders"
-POSITIONS_URL = f"{BASE_URL}/positions"
-OPEN_POSITIONS_URL = f"{BASE_URL}/openPositions"
-SUMMARY_URL = f"{BASE_URL}/summary"
-INSTRUMENTS_URL = f"{BASE_URL}/instruments"
-PRICING_URL = f"{BASE_URL}/pricing"
-
-HEADERS = {
-    "Authorization": f"Bearer {API_KEY}",
-    "Content-Type": "application/json",
-}
-REQUEST_TIMEOUT = 20
-
-FORCE_DYNAMIC_SIZING = os.environ.get("TGIM_FORCE_DYNAMIC_SIZING", "false").strip().lower() == "true"
-DEFAULT_RISK_PCT = Decimal(os.environ.get("TGIM_DEFAULT_RISK_PCT", "75"))
-MARGIN_SAFETY = Decimal(os.environ.get("TGIM_MARGIN_SAFETY", "0.95"))
-ALLOW_ADD_SAME_SIDE = os.environ.get("TGIM_ALLOW_ADD_SAME_SIDE", "false").strip().lower() == "true"
-MARGIN_RETRY = int(os.environ.get("TGIM_MARGIN_RETRY", "2"))
-MAX_SPREAD_PIPS = Decimal(os.environ.get("TGIM_MAX_SPREAD_PIPS", "4"))
-SPREAD_BUFFER_PIPS = Decimal(os.environ.get("TGIM_SPREAD_BUFFER_PIPS", "0"))
-
-# v7.2 portfolio-slot architecture.
-PORTFOLIO_SLOT_MODE = os.environ.get("TGIM_PORTFOLIO_SLOT_MODE", "true").strip().lower() == "true"
-MAX_PORTFOLIO_MARGIN_PCT = Decimal(os.environ.get("TGIM_MAX_PORTFOLIO_MARGIN_PCT", "30"))
-MAX_CONCURRENT_POSITIONS = max(1, int(os.environ.get("TGIM_MAX_CONCURRENT_POSITIONS", "3")))
-BLOCK_NY_5PM_HOUR = os.environ.get("TGIM_BLOCK_NY_5PM_HOUR", "true").strip().lower() == "true"
-NY_TZ = ZoneInfo("America/New_York")
-
-# The current Pine payload still sends risk_pct=1.8 because that number belongs to
-# its historical Strategy Tester model. In portfolio-slot mode the live backend is
-# authoritative and uses portfolio_cap / max_positions instead.
-RESPECT_PAYLOAD_RISK_PCT_IN_SLOT_MODE = (
-    os.environ.get("TGIM_RESPECT_PAYLOAD_RISK_PCT_IN_SLOT_MODE", "false").strip().lower() == "true"
-)
-
-# Serialize entry/flip processing so simultaneous TradingView alerts cannot all size
-# from the same pre-trade marginAvailable snapshot.
-ENTRY_LOCK = threading.RLock()
-
-# ──────────────────────────────────────────────
-# Generic helpers
-# ──────────────────────────────────────────────
-def d(x: Any, default: str = "0") -> Decimal:
-    try:
-        if x is None or x == "":
-            return Decimal(default)
-        return Decimal(str(x))
-    except (InvalidOperation, ValueError, TypeError):
-        return Decimal(default)
-
-
-def parse_bool(val: Any, default: bool = False) -> bool:
-    if val is None:
-        return default
-    if isinstance(val, bool):
-        return val
-    return str(val).strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def normalize(sym: Any) -> str:
-    s = str(sym or "").upper().strip()
-    s = (
-        s.replace("OANDA:", "")
-        .replace("FX:", "")
-        .replace("FOREXCOM:", "")
-        .replace("IDC:", "")
+try:
+    from numba import njit, prange
+except Exception as exc:
+    raise SystemExit(
+        "numba is required. Install requirements.txt first. "
+        f"Import error: {exc}"
     )
-    s = s.replace(":", "").replace("-", "").replace("/", "").replace(" ", "")
-    special = {"XAUUSD": "XAU_USD", "XAGUSD": "XAG_USD"}
-    if s in special:
-        return special[s]
-    if "_" in s:
-        return s
-    if len(s) == 6 and s.isalpha():
-        return f"{s[:3]}_{s[3:]}"
+
+FAMILIES = ("EMA", "HMA", "KS", "WMA")
+DEFAULT_LENGTHS = (5, 8, 13, 21, 27, 34)
+
+BASELINE = {
+    "R2": ("EMA", 5),
+    "R8": ("HMA", 27),
+    "R9": ("KS", 27),
+    "R10": ("KS", 27),
+}
+SLOT_TF = {"R2": "D", "R8": "M15", "R9": "M5", "R10": "M1"}
+SLOT_ORDER = ("R2", "R8", "R9", "R10")
+
+# Current 50SET screenshots supplied by the user.
+EXPECTED_TOTAL = {
+    "EUR_USD": 25,
+    "USD_CAD": 30,
+    "EUR_CAD": 22,
+    "USD_DKK": 27,
+}
+
+REGISTRY_LIMIT = 27
+
+
+def instrument_norm(raw: str) -> str:
+    s = raw.upper().replace("OANDA:", "").replace("/", "_").replace("-", "_")
+    if "_" not in s and len(s) == 6:
+        s = s[:3] + "_" + s[3:]
+    if len(s) != 7 or s[3] != "_":
+        raise ValueError(f"Bad instrument: {raw!r}")
     return s
 
 
-def instrument_parts(instrument: str) -> Tuple[str, str]:
-    parts = instrument.split("_")
-    if len(parts) == 2:
-        return parts[0], parts[1]
-    return instrument[:3], instrument[-3:]
+def pip_size(instrument: str) -> float:
+    return 0.01 if instrument.endswith("_JPY") else 0.0001
 
 
-def pip_size(instrument: str) -> Decimal:
-    # JPY pairs generally quote one pip as 0.01. Most FX pairs quote one pip as 0.0001.
-    _base, quote = instrument_parts(instrument)
-    if quote == "JPY":
-        return Decimal("0.01")
-    if instrument.startswith("XAU_") or instrument.startswith("XAG_"):
-        return Decimal("0.01")
-    return Decimal("0.0001")
+@dataclass(frozen=True)
+class RailCfg:
+    family: str
+    length: int
+
+    def label(self) -> str:
+        return f"{self.family}{self.length}"
 
 
-def to_int_units(val: Any) -> int:
-    q = d(val, "0").to_integral_value(rounding=ROUND_HALF_UP)
-    n = int(q)
-    if n < 1:
-        raise ValueError(f"units_must_be_positive_integer: got={val!r}")
-    return n
-
-
-def floor_units(val: Decimal) -> int:
-    n = int(val.to_integral_value(rounding=ROUND_DOWN))
-    return max(1, n)
-
-
-def response_json(response: requests.Response) -> Dict[str, Any]:
-    try:
-        return response.json()
-    except Exception:
-        return {"text": response.text}
-
-
-def log_event(tag: str, payload: Any) -> None:
-    print(f"\n===== {tag} =====")
-    try:
-        print(json.dumps(payload, indent=2, ensure_ascii=False)[:5000])
-    except Exception:
-        print(str(payload)[:5000])
-    print("====================\n")
-
-
-def log_oanda_response(tag: str, response: requests.Response) -> Dict[str, Any]:
-    body = response_json(response)
-    try:
-        req_body = response.request.body
-        if isinstance(req_body, (bytes, bytearray)):
-            req_body = req_body.decode(errors="replace")
-    except Exception:
-        req_body = "<unavailable>"
-    print(f"\n🔹 [{tag}] Status: {response.status_code}")
-    print("🔸 URL:", response.url)
-    print("📦 Payload snippet:", str(req_body)[:1500])
-    print("📜 Response snippet:", json.dumps(body, ensure_ascii=False)[:3000])
-    print("──────────────────────────────────────────────\n")
-    return body
-
-
-def tv_response(payload: Dict[str, Any], status: int = 200):
-    # Keep TradingView alerts from pausing on broker/account issues; details live in payload.ok/result.
-    return jsonify(payload), status
-
-
-def hard_error(payload: Dict[str, Any], status: int = 400):
-    return jsonify(payload), status
-
-# ──────────────────────────────────────────────
-# OANDA read helpers
-# ──────────────────────────────────────────────
-def get_account_summary() -> Tuple[int, Dict[str, Any]]:
-    r = requests.get(SUMMARY_URL, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-    body = log_oanda_response("OANDA-ACCOUNT-SUMMARY", r)
-    return r.status_code, body
-
-
-def get_account_snapshot() -> Tuple[int, Dict[str, Any]]:
-    status, body = get_account_summary()
-    if status >= 300:
-        return status, {"ok": False, "error": "account_summary_failed", "body": body}
-    acct = body.get("account", {})
-    nav = d(acct.get("NAV", acct.get("balance", "0")), "0")
-    balance = d(acct.get("balance", "0"), "0")
-    sizing_equity = min(nav, balance) if nav > 0 and balance > 0 else max(nav, balance)
-    return status, {
-        "ok": True,
-        "currency": acct.get("currency", "USD"),
-        "NAV": str(nav),
-        "balance": str(balance),
-        "sizingEquity": str(sizing_equity),
-        "marginAvailable": str(acct.get("marginAvailable", "0")),
-        "marginUsed": str(acct.get("marginUsed", "0")),
-        "unrealizedPL": str(acct.get("unrealizedPL", "0")),
-        "openPositionCount": int(acct.get("openPositionCount", 0) or 0),
-        "raw": acct,
-    }
-
-
-def get_instruments_map() -> Tuple[int, Dict[str, Any]]:
-    r = requests.get(INSTRUMENTS_URL, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-    body = log_oanda_response("OANDA-INSTRUMENTS", r)
-    if r.status_code >= 300:
-        return r.status_code, {"ok": False, "body": body}
-    m = {}
-    for inst in body.get("instruments", []):
-        name = inst.get("name")
-        if name:
-            m[name] = inst
-    return r.status_code, {"ok": True, "instruments": m}
-
-
-def get_instrument_details(instrument: str) -> Tuple[int, Dict[str, Any]]:
-    status, body = get_instruments_map()
-    if status >= 300 or not body.get("ok"):
-        return status, {"ok": False, "error": "instruments_lookup_failed", "body": body}
-    inst = body["instruments"].get(instrument)
-    if not inst:
-        return 404, {"ok": False, "error": "instrument_not_found_for_account", "instrument": instrument}
-    margin_rate = d(inst.get("marginRate"), "0")
-    leverage = (Decimal("1") / margin_rate) if margin_rate > 0 else Decimal("0")
-    return 200, {
-        "ok": True,
-        "instrument": instrument,
-        "marginRate": str(margin_rate),
-        "impliedLeverage": str(leverage),
-        "pipLocation": inst.get("pipLocation"),
-        "displayPrecision": inst.get("displayPrecision"),
-        "tradeUnitsPrecision": inst.get("tradeUnitsPrecision"),
-        "minimumTradeSize": inst.get("minimumTradeSize"),
-        "raw": inst,
-    }
-
-
-def get_pricing(instruments: list[str]) -> Tuple[int, Dict[str, Any]]:
-    params = {"instruments": ",".join(instruments), "includeHomeConversions": "true"}
-    r = requests.get(PRICING_URL, headers=HEADERS, params=params, timeout=REQUEST_TIMEOUT)
-    body = log_oanda_response("OANDA-PRICING", r)
-    return r.status_code, body
-
-
-def best_bid_ask(price_obj: Dict[str, Any]) -> Tuple[Decimal, Decimal]:
-    bids = price_obj.get("bids") or []
-    asks = price_obj.get("asks") or []
-    bid = d(bids[0].get("price") if bids else price_obj.get("closeoutBid"), "0")
-    ask = d(asks[0].get("price") if asks else price_obj.get("closeoutAsk"), "0")
-    return bid, ask
-
-
-def extract_quote_to_home_conversion(price_obj: Dict[str, Any], quote_ccy: str, home_ccy: str) -> Decimal:
-    # Most reliable when includeHomeConversions=true. Different OANDA responses can expose conversion factors in slightly different shapes.
-    if quote_ccy == home_ccy:
-        return Decimal("1")
-    convs = price_obj.get("homeConversions") or []
-    for c in convs:
-        ccy = str(c.get("currency", "")).upper()
-        if ccy == quote_ccy:
-            # For margin reserve, use a conservative factor. Prefer positive ask, then bid, then factor.
-            for k in ("accountGain", "accountLoss", "positionValue", "ask", "bid", "factor"):
-                val = d(c.get(k), "0")
-                if val > 0:
-                    return val
-    return Decimal("1")
-
-
-def get_market_snapshot(instrument: str, account_currency: str = "USD") -> Tuple[int, Dict[str, Any]]:
-    status, body = get_pricing([instrument])
-    if status >= 300:
-        return status, {"ok": False, "error": "pricing_failed", "body": body}
-    prices = body.get("prices") or []
-    if not prices:
-        return 404, {"ok": False, "error": "no_price_returned", "instrument": instrument, "body": body}
-    p = prices[0]
-    bid, ask = best_bid_ask(p)
-    if bid <= 0 or ask <= 0:
-        return 409, {"ok": False, "error": "bad_bid_ask", "instrument": instrument, "price": p}
-    mid = (bid + ask) / Decimal("2")
-    spread_price = ask - bid
-    pip = pip_size(instrument)
-    spread_pips = spread_price / pip if pip > 0 else Decimal("0")
-    base, quote = instrument_parts(instrument)
-    quote_to_home = extract_quote_to_home_conversion(p, quote, str(account_currency or "USD").upper())
-    return 200, {
-        "ok": True,
-        "instrument": instrument,
-        "status": p.get("status"),
-        "tradeable": p.get("tradeable", p.get("status") == "tradeable"),
-        "time": p.get("time"),
-        "bid": str(bid),
-        "ask": str(ask),
-        "mid": str(mid),
-        "spread": str(spread_price),
-        "spreadPips": str(spread_pips),
-        "pipSize": str(pip),
-        "quoteCurrency": quote,
-        "accountCurrency": account_currency,
-        "quoteToHomeConversion": str(quote_to_home),
-        "raw": p,
-    }
-
-
-def get_open_positions_raw() -> Tuple[int, Dict[str, Any]]:
-    r = requests.get(OPEN_POSITIONS_URL, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-    body = log_oanda_response("OANDA-OPEN-POSITIONS", r)
-    return r.status_code, body
-
-
-def get_position(instrument: str) -> Tuple[bool, int, int, Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    status, body = get_open_positions_raw()
-    if status >= 300:
-        return False, 0, 0, None, {"status": status, "body": body}
-    for pos in body.get("positions", []):
-        if pos.get("instrument") == instrument:
-            long_units = int(d(pos.get("long", {}).get("units", "0")))
-            short_units_abs = int(abs(d(pos.get("short", {}).get("units", "0"))))
-            return True, long_units, short_units_abs, pos, None
-    return False, 0, 0, None, None
-
-
-def snapshot_position(instrument: str) -> Dict[str, Any]:
-    found, long_units, short_units_abs, raw, err = get_position(instrument)
-    return {"instrument": instrument, "found": found, "long_units": long_units, "short_units": short_units_abs, "raw": raw, "error": err}
-
-# ──────────────────────────────────────────────
-# Portfolio-slot / rollover helpers
-# ──────────────────────────────────────────────
-def ny_rollover_blocked_now() -> Tuple[bool, str]:
-    if not BLOCK_NY_5PM_HOUR:
-        return False, ""
-    now_ny = datetime_now_ny()
-    if now_ny.hour == 17:
-        return True, now_ny.isoformat()
-    return False, now_ny.isoformat()
-
-
-def datetime_now_ny():
-    # Isolated for deterministic testing / monkeypatching.
-    from datetime import datetime
-    return datetime.now(NY_TZ)
-
-
-def portfolio_budget(acct: Dict[str, Any], payload_risk_pct: Decimal) -> Dict[str, Any]:
-    nav = d(acct.get("NAV"), "0")
-    balance = d(acct.get("balance"), "0")
-    sizing_equity = d(acct.get("sizingEquity"), "0")
-    if sizing_equity <= 0:
-        sizing_equity = min(nav, balance) if nav > 0 and balance > 0 else max(nav, balance)
-
-    margin_used = d(acct.get("marginUsed"), "0")
-    margin_available = d(acct.get("marginAvailable"), "0")
-    open_count = int(acct.get("openPositionCount", 0) or 0)
-
-    cap_pct = max(Decimal("0"), MAX_PORTFOLIO_MARGIN_PCT)
-    cap_amount = sizing_equity * cap_pct / Decimal("100")
-    remaining_under_cap = max(Decimal("0"), cap_amount - margin_used)
-
-    slot_pct = cap_pct / Decimal(MAX_CONCURRENT_POSITIONS)
-    if RESPECT_PAYLOAD_RISK_PCT_IN_SLOT_MODE and payload_risk_pct > 0:
-        slot_pct = min(slot_pct, payload_risk_pct)
-    slot_target = sizing_equity * slot_pct / Decimal("100")
-
-    # Never consume more than portfolio headroom or safely available OANDA margin.
-    broker_available_safe = max(Decimal("0"), margin_available * MARGIN_SAFETY)
-    margin_to_use = min(slot_target, remaining_under_cap, broker_available_safe)
-
-    return {
-        "sizingEquity": sizing_equity,
-        "NAV": nav,
-        "balance": balance,
-        "marginUsed": margin_used,
-        "marginAvailable": margin_available,
-        "openPositionCount": open_count,
-        "portfolioCapPct": cap_pct,
-        "portfolioCapAmount": cap_amount,
-        "remainingUnderCap": remaining_under_cap,
-        "slotTargetPct": slot_pct,
-        "slotTargetMargin": slot_target,
-        "brokerAvailableSafe": broker_available_safe,
-        "marginToUse": margin_to_use,
-        "maxConcurrentPositions": MAX_CONCURRENT_POSITIONS,
-    }
-
-
-# ──────────────────────────────────────────────
-# Dynamic sizing
-# ──────────────────────────────────────────────
-def dynamic_units_for_instrument(
-    instrument: str,
-    risk_pct: Decimal,
-    side: str,
-    max_spread_pips_override: Optional[Decimal] = None
-) -> Tuple[int, Dict[str, Any]]:
-    acct_status, acct = get_account_snapshot()
-    if acct_status >= 300 or not acct.get("ok"):
-        raise RuntimeError(f"account_snapshot_failed: {acct}")
-    account_ccy = acct.get("currency", "USD")
-
-    inst_status, inst = get_instrument_details(instrument)
-    if inst_status >= 300 or not inst.get("ok"):
-        raise RuntimeError(f"instrument_details_failed: {inst}")
-
-    mkt_status, mkt = get_market_snapshot(instrument, account_ccy)
-    if mkt_status >= 300 or not mkt.get("ok"):
-        raise RuntimeError(f"market_snapshot_failed: {mkt}")
-
-    spread_pips = d(mkt.get("spreadPips"), "0")
-
-    # Environment value is a hard ceiling. Payload may tighten it, never loosen it.
-    payload_max = max_spread_pips_override if max_spread_pips_override is not None else Decimal("0")
-    env_max = MAX_SPREAD_PIPS
-    if env_max > 0 and payload_max > 0:
-        effective_max_spread_pips = min(env_max, payload_max)
-    elif env_max > 0:
-        effective_max_spread_pips = env_max
-    else:
-        effective_max_spread_pips = payload_max
-
-    if effective_max_spread_pips > 0 and spread_pips > effective_max_spread_pips:
-        raise RuntimeError(
-            f"spread_too_wide: spread_pips={spread_pips} max={effective_max_spread_pips}"
+class OandaHistory:
+    def __init__(self, token: str, env: str, cache_dir: Path, timeout: float = 20.0):
+        if not token:
+            raise ValueError(
+                "OANDA_TOKEN is empty. Set it in the environment or pass --token."
+            )
+        self.base = (
+            "https://api-fxpractice.oanda.com"
+            if env == "practice"
+            else "https://api-fxtrade.oanda.com"
         )
+        self.timeout = timeout
+        self.cache_dir = cache_dir
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.s = requests.Session()
+        self.s.headers.update({
+            "Authorization": f"Bearer {token}",
+            "Accept-Datetime-Format": "RFC3339",
+        })
 
-    margin_rate = d(inst.get("marginRate"), "0")
-    quote_to_home = d(mkt.get("quoteToHomeConversion"), "1")
-    mid = d(mkt.get("mid"), "0")
-    pip = d(mkt.get("pipSize"), "0.0001")
+    def _request(self, path: str, params: dict) -> dict:
+        last_err = None
+        for attempt in range(6):
+            try:
+                r = self.s.get(self.base + path, params=params, timeout=self.timeout)
+                if r.status_code == 429:
+                    time.sleep(min(8.0, 0.75 * (2 ** attempt)))
+                    continue
+                r.raise_for_status()
+                return r.json()
+            except Exception as exc:
+                last_err = exc
+                time.sleep(min(5.0, 0.5 * (2 ** attempt)))
+        raise RuntimeError(f"OANDA request failed after retries: {last_err}")
 
-    if margin_rate <= 0 or mid <= 0:
-        raise RuntimeError(f"bad_sizing_inputs: margin_rate={margin_rate} mid={mid}")
+    def candles(
+        self,
+        instrument: str,
+        granularity: str,
+        start: datetime,
+        end: datetime,
+        refresh: bool = False,
+    ) -> pd.DataFrame:
+        key = (
+            f"{instrument}_{granularity}_"
+            f"{start.strftime('%Y%m%d')}_{end.strftime('%Y%m%d')}.csv.gz"
+        )
+        cache = self.cache_dir / key
+        if cache.exists() and not refresh:
+            df = pd.read_csv(cache, compression="gzip")
+            df["time"] = pd.to_datetime(df["time"], utc=True)
+            return df
 
-    if PORTFOLIO_SLOT_MODE:
-        budget = portfolio_budget(acct, risk_pct)
-        if budget["openPositionCount"] >= MAX_CONCURRENT_POSITIONS:
-            raise RuntimeError(
-                f"max_concurrent_positions_reached: "
-                f"{budget['openPositionCount']}/{MAX_CONCURRENT_POSITIONS}"
-            )
-        margin_to_use = budget["marginToUse"]
-        if margin_to_use <= 0:
-            raise RuntimeError(
-                f"portfolio_margin_cap_reached: used={budget['marginUsed']} "
-                f"cap={budget['portfolioCapAmount']}"
-            )
-        effective_risk_pct = budget["slotTargetPct"]
-    else:
-        nav = d(acct.get("NAV"), "0")
-        margin_avail = d(acct.get("marginAvailable"), "0")
-        target_margin = nav * (risk_pct / Decimal("100"))
-        margin_cap = margin_avail * MARGIN_SAFETY
-        margin_to_use = min(target_margin, margin_cap) if margin_avail > 0 else target_margin
-        budget = {
-            "sizingEquity": nav,
-            "NAV": nav,
-            "balance": d(acct.get("balance"), "0"),
-            "marginUsed": d(acct.get("marginUsed"), "0"),
-            "marginAvailable": margin_avail,
-            "openPositionCount": int(acct.get("openPositionCount", 0) or 0),
-            "portfolioCapPct": None,
-            "portfolioCapAmount": None,
-            "remainingUnderCap": None,
-            "slotTargetPct": risk_pct,
-            "slotTargetMargin": target_margin,
-            "brokerAvailableSafe": margin_cap,
-            "marginToUse": margin_to_use,
-            "maxConcurrentPositions": None,
-        }
-        effective_risk_pct = risk_pct
+        rows = []
+        cursor = start.astimezone(timezone.utc)
+        end = end.astimezone(timezone.utc)
+        path = f"/v3/instruments/{instrument}/candles"
 
-    margin_per_unit = mid * quote_to_home * margin_rate
-    spread_buffer_per_unit = SPREAD_BUFFER_PIPS * pip * quote_to_home
-    cost_per_unit = margin_per_unit + spread_buffer_per_unit
-    if cost_per_unit <= 0:
-        raise RuntimeError(f"bad_cost_per_unit: {cost_per_unit}")
+        # Approximate candle durations for pagination cursor advancement.
+        sec_map = {"M1": 60, "M5": 300, "M15": 900, "D": 86400}
+        step_sec = sec_map[granularity]
 
-    units_raw = margin_to_use / cost_per_unit
-    units = floor_units(units_raw)
+        while cursor < end:
+            params = {
+                "price": "M",
+                "granularity": granularity,
+                "from": cursor.isoformat().replace("+00:00", "Z"),
+                "count": 5000,
+                "includeFirst": "true",
+                "smooth": "false",
+                "dailyAlignment": 17,
+                "alignmentTimezone": "America/New_York",
+            }
+            data = self._request(path, params)
+            candles = data.get("candles", [])
+            if not candles:
+                break
 
-    return units, {
-        "mode": "portfolio_slot_dynamic_margin" if PORTFOLIO_SLOT_MODE else "dynamic_margin",
-        "instrument": instrument,
-        "side": side,
-        "payloadRiskPct": str(risk_pct),
-        "effectiveRiskPct": str(effective_risk_pct),
-        "portfolioSlotMode": PORTFOLIO_SLOT_MODE,
-        "respectPayloadRiskPctInSlotMode": RESPECT_PAYLOAD_RISK_PCT_IN_SLOT_MODE,
-        "sizingEquity": str(budget["sizingEquity"]),
-        "NAV": str(budget["NAV"]),
-        "balance": str(budget["balance"]),
-        "marginAvailable": str(budget["marginAvailable"]),
-        "marginUsed": str(budget["marginUsed"]),
-        "openPositionCount": budget["openPositionCount"],
-        "portfolioCapPct": None if budget["portfolioCapPct"] is None else str(budget["portfolioCapPct"]),
-        "portfolioCapAmount": None if budget["portfolioCapAmount"] is None else str(budget["portfolioCapAmount"]),
-        "remainingUnderCap": None if budget["remainingUnderCap"] is None else str(budget["remainingUnderCap"]),
-        "slotTargetPct": str(budget["slotTargetPct"]),
-        "slotTargetMargin": str(budget["slotTargetMargin"]),
-        "marginToUse": str(margin_to_use),
-        "marginSafety": str(MARGIN_SAFETY),
-        "marginRate": str(margin_rate),
-        "impliedLeverage": inst.get("impliedLeverage"),
-        "bid": mkt.get("bid"),
-        "ask": mkt.get("ask"),
-        "mid": mkt.get("mid"),
-        "spread": mkt.get("spread"),
-        "spreadPips": mkt.get("spreadPips"),
-        "maxSpreadPipsEnvHardCeiling": str(MAX_SPREAD_PIPS),
-        "maxSpreadPipsPayload": str(max_spread_pips_override) if max_spread_pips_override is not None else None,
-        "maxSpreadPipsEffective": str(effective_max_spread_pips),
-        "pipSize": mkt.get("pipSize"),
-        "quoteToHomeConversion": str(quote_to_home),
-        "marginPerUnit": str(margin_per_unit),
-        "spreadBufferPips": str(SPREAD_BUFFER_PIPS),
-        "spreadBufferPerUnit": str(spread_buffer_per_unit),
-        "costPerUnit": str(cost_per_unit),
-        "unitsRaw": str(units_raw),
-        "finalUnits": units,
-        "account": acct,
-        "instrumentDetails": inst,
-        "market": mkt,
-    }
-
-
-def choose_units(data: Dict[str, Any], instrument: str, action: str) -> Tuple[int, Dict[str, Any]]:
-    sizing_mode = str(data.get("sizing_mode", data.get("sizingMode", ""))).lower().strip()
-    risk_pct = d(data.get("risk_pct", data.get("riskPct", DEFAULT_RISK_PCT)), str(DEFAULT_RISK_PCT))
-    max_spread_raw = data.get("max_spread_pips", data.get("maxSpreadPips", None))
-    max_spread_pips_override = None if max_spread_raw in (None, "") else d(max_spread_raw, "0")
-    use_dynamic = FORCE_DYNAMIC_SIZING or sizing_mode in {"percent_equity", "dynamic_margin", "margin", "account_percent"}
-    if use_dynamic:
-        return dynamic_units_for_instrument(instrument, risk_pct, action, max_spread_pips_override=max_spread_pips_override)
-    units = to_int_units(data.get("units"))
-    return units, {"mode": "payload_units", "finalUnits": units, "payloadUnits": data.get("units")}
-
-
-def enforce_entry_spread_guard(data: Dict[str, Any], instrument: str) -> Dict[str, Any]:
-    """Hard broker-side entry/flip spread lock.
-
-    This runs before opening any new position, even when fixed units are used.
-    Close actions intentionally bypass it so the bot can always reduce/flatten risk.
-    Payload max_spread_pips overrides the Render env value when supplied.
-    """
-    max_spread_raw = data.get("max_spread_pips", data.get("maxSpreadPips", None))
-    payload_max = Decimal("0") if max_spread_raw in (None, "") else d(max_spread_raw, "0")
-    if MAX_SPREAD_PIPS > 0 and payload_max > 0:
-        effective_max = min(MAX_SPREAD_PIPS, payload_max)
-    elif MAX_SPREAD_PIPS > 0:
-        effective_max = MAX_SPREAD_PIPS
-    else:
-        effective_max = payload_max
-    acct_status, acct = get_account_snapshot()
-    acct_ccy = acct.get("currency", "USD") if acct_status < 300 and acct.get("ok") else "USD"
-    mkt_status, mkt = get_market_snapshot(instrument, acct_ccy)
-    if mkt_status >= 300 or not mkt.get("ok"):
-        return {"ok": False, "blocked": True, "reason": "spread_check_failed", "broker_status": mkt_status, "maxSpreadPipsEffective": str(effective_max), "market": mkt}
-    spread_pips = d(mkt.get("spreadPips"), "0")
-    if effective_max > 0 and spread_pips > effective_max:
-        return {"ok": False, "blocked": True, "reason": "spread_too_wide", "spreadPips": str(spread_pips), "maxSpreadPipsEffective": str(effective_max), "market": mkt}
-    return {"ok": True, "blocked": False, "spreadPips": str(spread_pips), "maxSpreadPipsEffective": str(effective_max), "market": mkt}
-
-# ──────────────────────────────────────────────
-# OANDA write helpers
-# ──────────────────────────────────────────────
-def place_market_order(instrument: str, signed_units: int) -> Tuple[int, Dict[str, Any]]:
-    payload = {
-        "order": {
-            "instrument": instrument,
-            "units": str(int(signed_units)),
-            "type": "MARKET",
-            "timeInForce": "FOK",
-            "positionFill": "DEFAULT",
-        }
-    }
-    r = requests.post(ORDERS_URL, headers=HEADERS, json=payload, timeout=REQUEST_TIMEOUT)
-    body = log_oanda_response("OANDA-ORDER", r)
-    return r.status_code, body
-
-
-def close_position(instrument: str, side: str, ignore_if_flat: bool = True) -> Tuple[int, Dict[str, Any]]:
-    side_norm = str(side or "").lower().strip()
-    if side_norm in {"buy", "long", "close_buy"}:
-        human_side, close_field = "long", "longUnits"
-    elif side_norm in {"sell", "short", "close_sell"}:
-        human_side, close_field = "short", "shortUnits"
-    else:
-        return 400, {"ok": False, "error": "bad_close_side", "side": side}
-
-    found, long_units, short_units_abs, raw, pos_err = get_position(instrument)
-    if pos_err:
-        return pos_err["status"], {"ok": False, "stage": "position_check_before_close", "error": pos_err}
-
-    has_side = (human_side == "long" and long_units > 0) or (human_side == "short" and short_units_abs > 0)
-    if not has_side:
-        if ignore_if_flat:
-            return 200, {"ok": True, "ignored": True, "reason": "already_flat_or_no_matching_side", "instrument": instrument, "side": human_side, "long_units": long_units, "short_units": short_units_abs}
-        return 409, {"ok": False, "error": "no_matching_position_to_close", "instrument": instrument, "side": human_side, "long_units": long_units, "short_units": short_units_abs}
-
-    url = f"{POSITIONS_URL}/{instrument}/close"
-    payload = {close_field: "ALL"}
-    r = requests.put(url, headers=HEADERS, json=payload, timeout=REQUEST_TIMEOUT)
-    body = log_oanda_response(f"OANDA-CLOSE-{human_side.upper()}", r)
-    if r.status_code >= 300:
-        return r.status_code, {"ok": False, "stage": "close_position", "oanda": body}
-
-    time.sleep(0.15)
-    found2, long2, short2, raw2, err2 = get_position(instrument)
-    if err2:
-        return err2["status"], {"ok": False, "stage": "verify_close", "error": err2, "close_response": body}
-    still_open = (human_side == "long" and long2 > 0) or (human_side == "short" and short2 > 0)
-    if still_open:
-        return 409, {"ok": False, "stage": "verify_close", "error": "side_still_open_after_close", "instrument": instrument, "side": human_side, "long_units": long2, "short_units": short2, "close_response": body, "position_after_close": raw2}
-
-    return 200, {"ok": True, "instrument": instrument, "side": human_side, "closed": True, "oanda": body, "position_after_close": {"found": found2, "long_units": long2, "short_units": short2}}
-
-
-def strict_synced_entry(action: str, instrument: str, units: int, sizing: Dict[str, Any], policy: str = "sync") -> Tuple[int, Dict[str, Any]]:
-    action_norm = str(action or "").lower().strip()
-    if action_norm not in {"buy", "sell"}:
-        return 400, {"ok": False, "error": "bad_entry_action", "action": action}
-
-    before = snapshot_position(instrument)
-    if before.get("error"):
-        return before["error"]["status"], {"ok": False, "stage": "pre_entry_position_check", "position": before, "sizing": sizing}
-
-    opposite_side = "short" if action_norm == "buy" else "long"
-    same_side = "long" if action_norm == "buy" else "short"
-    opposite_units = before["short_units"] if action_norm == "buy" else before["long_units"]
-    same_units = before["long_units"] if action_norm == "buy" else before["short_units"]
-
-    if same_units > 0 and not ALLOW_ADD_SAME_SIDE:
-        return 200, {"ok": True, "ignored": True, "reason": "same_side_position_already_open_no_stacking", "action_requested": action_norm, "instrument": instrument, "same_side": same_side, "same_units_before": same_units, "position_before": before, "sizing": sizing}
-
-    close_status = None
-    close_body = None
-    if str(policy or "sync").lower().strip() == "sync" and opposite_units > 0:
-        close_status, close_body = close_position(instrument, opposite_side, ignore_if_flat=False)
-        if close_status >= 300 or not close_body.get("ok", False):
-            return 409, {"ok": False, "blocked_new_entry": True, "reason": "opposite_close_failed_no_hedge_enforced", "action_requested": action_norm, "instrument": instrument, "units_requested": units, "opposite_side": opposite_side, "opposite_units_before": opposite_units, "position_before": before, "close_attempt": {"broker_status": close_status, "body": close_body}, "sizing": sizing}
-
-    verified = snapshot_position(instrument)
-    if verified.get("error"):
-        return verified["error"]["status"], {"ok": False, "stage": "verify_before_entry", "position": verified, "sizing": sizing}
-    verified_opposite_units = verified["short_units"] if action_norm == "buy" else verified["long_units"]
-    if verified_opposite_units > 0:
-        return 409, {"ok": False, "blocked_new_entry": True, "reason": "opposite_position_still_exists_before_entry", "action_requested": action_norm, "instrument": instrument, "opposite_side": opposite_side, "opposite_units": verified_opposite_units, "position_before": before, "position_verified": verified, "close_attempt": {"broker_status": close_status, "body": close_body}, "sizing": sizing}
-
-    signed_units = units if action_norm == "buy" else -units
-    order_status, order_body = place_market_order(instrument, signed_units)
-
-    # Retry margin rejection with smaller units.
-    attempts = [{"units": signed_units, "broker_status": order_status, "body": order_body}]
-    retry_units = abs(signed_units)
-    retries_left = max(0, MARGIN_RETRY)
-    while order_status >= 300 and retries_left > 0 and retry_units > 1:
-        txt = json.dumps(order_body).lower()
-        if "margin" not in txt and "insufficient" not in txt:
-            break
-        retry_units = max(1, int(Decimal(retry_units) * Decimal("0.90")))
-        signed_retry = retry_units if action_norm == "buy" else -retry_units
-        order_status, order_body = place_market_order(instrument, signed_retry)
-        attempts.append({"units": signed_retry, "broker_status": order_status, "body": order_body})
-        retries_left -= 1
-        signed_units = signed_retry
-
-    after = snapshot_position(instrument)
-    return order_status, {"ok": order_status < 300, "action": action_norm, "instrument": instrument, "units": signed_units, "policy": policy, "position_before": before, "opposite_close": {"broker_status": close_status, "body": close_body}, "order_attempts": attempts, "order": {"broker_status": order_status, "body": order_body}, "position_after": after, "sizing": sizing}
-
-
-def close_all(instrument: str, ignore_if_flat: bool = True) -> Dict[str, Any]:
-    long_status, long_body = close_position(instrument, "long", ignore_if_flat=ignore_if_flat)
-    short_status, short_body = close_position(instrument, "short", ignore_if_flat=ignore_if_flat)
-    return {"ok": long_status < 300 and short_status < 300, "instrument": instrument, "long_close": {"broker_status": long_status, "body": long_body}, "short_close": {"broker_status": short_status, "body": short_body}}
-
-# ──────────────────────────────────────────────
-# Routes
-# ──────────────────────────────────────────────
-@app.route("/", methods=["GET", "HEAD"])
-def root():
-    return jsonify({
-        "ok": True,
-        "service": "TGIM OANDA Dynamic Margin + Spread Webhook v7.2 — Portfolio Slot + Rollover Lock",
-        "route": "/webhook",
-        "dynamic_margin_sizing": True,
-        "force_dynamic_sizing": FORCE_DYNAMIC_SIZING,
-        "default_risk_pct": str(DEFAULT_RISK_PCT),
-        "margin_safety": str(MARGIN_SAFETY),
-        "max_spread_pips_env": str(MAX_SPREAD_PIPS),
-        "max_spread_payload_override": True,
-        "hard_entry_spread_lock": True,
-        "spread_buffer_pips": str(SPREAD_BUFFER_PIPS),
-        "no_hedge_enforced": True,
-        "portfolio_slot_mode": PORTFOLIO_SLOT_MODE,
-        "max_portfolio_margin_pct": str(MAX_PORTFOLIO_MARGIN_PCT),
-        "max_concurrent_positions": MAX_CONCURRENT_POSITIONS,
-        "default_slot_margin_pct": str(MAX_PORTFOLIO_MARGIN_PCT / Decimal(MAX_CONCURRENT_POSITIONS)),
-        "sizing_equity": "MIN(balance,NAV)",
-        "ny_5pm_entry_blackout": BLOCK_NY_5PM_HOUR,
-        "serialized_entry_processing": True,
-        "payload_risk_pct_is_historical_only_in_slot_mode": not RESPECT_PAYLOAD_RISK_PCT_IN_SLOT_MODE,
-    })
-
-
-@app.route("/webhook", methods=["GET", "HEAD"])
-def webhook_get():
-    return jsonify({"ok": True, "route": "/webhook", "expect": "POST JSON", "service": "v7.2", "spread_endpoint": "/spread/<instrument>"})
-
-
-@app.route("/spread/<instrument>", methods=["GET"])
-def spread_route(instrument: str):
-    inst = normalize(instrument)
-    acct_status, acct = get_account_snapshot()
-    acct_ccy = acct.get("currency", "USD") if acct_status < 300 and acct.get("ok") else "USD"
-    status, snap = get_market_snapshot(inst, acct_ccy)
-    return tv_response({"ok": status < 300, "instrument": inst, "broker_status": status, "spread": snap}, 200)
-
-
-@app.route("/status/<instrument>", methods=["GET"])
-def status_route(instrument: str):
-    inst = normalize(instrument)
-    acct_status, acct = get_account_snapshot()
-    acct_ccy = acct.get("currency", "USD") if acct_status < 300 and acct.get("ok") else "USD"
-    mkt_status, mkt = get_market_snapshot(inst, acct_ccy)
-    inst_status, details = get_instrument_details(inst)
-    pos = snapshot_position(inst)
-    return tv_response({"ok": True, "instrument": inst, "account": acct, "instrumentDetails": details, "market": mkt, "position": pos})
-
-
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    data = request.get_json(silent=True)
-    if not isinstance(data, dict):
-        return hard_error({"ok": False, "error": "expected_json_object"}, 400)
-    log_event("TRADINGVIEW-PAYLOAD", data)
-
-    action = str(data.get("action", "")).lower().strip()
-    raw_instrument = data.get("instrument") or data.get("pair") or data.get("symbol")
-    instrument = normalize(raw_instrument)
-    ignore_if_flat = parse_bool(data.get("ignore_if_flat"), default=True)
-    policy = str(data.get("position_policy", "sync")).lower().strip()
-
-    if not action:
-        return hard_error({"ok": False, "error": "missing_action", "payload": data}, 400)
-    if not instrument:
-        return hard_error({"ok": False, "error": "missing_instrument", "payload": data}, 400)
-
-    try:
-        if action == "status":
-            acct_status, acct = get_account_snapshot()
-            acct_ccy = acct.get("currency", "USD") if acct_status < 300 and acct.get("ok") else "USD"
-            mkt_status, mkt = get_market_snapshot(instrument, acct_ccy)
-            details_status, details = get_instrument_details(instrument)
-            pos = snapshot_position(instrument)
-            return tv_response({"ok": True, "action": action, "instrument": instrument, "account": acct, "instrumentDetails": details, "market": mkt, "position": pos})
-
-        if action == "spread":
-            acct_status, acct = get_account_snapshot()
-            acct_ccy = acct.get("currency", "USD") if acct_status < 300 and acct.get("ok") else "USD"
-            mkt_status, mkt = get_market_snapshot(instrument, acct_ccy)
-            return tv_response({"ok": mkt_status < 300, "action": action, "instrument": instrument, "broker_status": mkt_status, "spread": mkt})
-
-        if action == "close_buy":
-            status, body = close_position(instrument, "long", ignore_if_flat=ignore_if_flat)
-            return tv_response({"ok": status < 300, "action": action, "instrument": instrument, "broker_status": status, "result": body})
-
-        if action == "close_sell":
-            status, body = close_position(instrument, "short", ignore_if_flat=ignore_if_flat)
-            return tv_response({"ok": status < 300, "action": action, "instrument": instrument, "broker_status": status, "result": body})
-
-        if action == "close":
-            side = data.get("side") or data.get("target")
-            status, body = close_position(instrument, str(side), ignore_if_flat=ignore_if_flat)
-            return tv_response({"ok": status < 300, "action": action, "instrument": instrument, "side": side, "broker_status": status, "result": body})
-
-        if action == "close_all":
-            body = close_all(instrument, ignore_if_flat=ignore_if_flat)
-            return tv_response({"ok": body.get("ok", False), "action": action, "instrument": instrument, "result": body})
-
-        if action in {"buy", "sell"}:
-            rollover_blocked, ny_now = ny_rollover_blocked_now()
-            if rollover_blocked:
-                return tv_response({
-                    "ok": False, "action": action, "instrument": instrument,
-                    "blocked_new_entry": True, "reason": "ny_5pm_rollover_blackout",
-                    "newYorkTime": ny_now
-                })
-            with ENTRY_LOCK:
-                spread_guard = enforce_entry_spread_guard(data, instrument)
-                if not spread_guard.get("ok", False):
-                    return tv_response({"ok": False, "action": action, "instrument": instrument, "blocked_new_entry": True, "result": spread_guard})
-                units, sizing = choose_units(data, instrument, action)
-                sizing["entrySpreadGuard"] = spread_guard
-                sizing["newYorkTime"] = ny_now
-                status, body = strict_synced_entry(action, instrument, units, sizing, policy=policy)
-                return tv_response({"ok": status < 300 and body.get("ok", False), "action": action, "instrument": instrument, "broker_status": status, "result": body})
-
-        if action == "flip":
-            target = str(data.get("target") or data.get("side") or "").lower().strip()
-            rollover_blocked, ny_now = ny_rollover_blocked_now()
-            if rollover_blocked:
-                return tv_response({
-                    "ok": False, "action": action, "instrument": instrument, "target": target,
-                    "blocked_new_entry": True, "reason": "ny_5pm_rollover_blackout",
-                    "newYorkTime": ny_now
-                })
-            with ENTRY_LOCK:
-                if target in {"buy", "long"}:
-                    entry_payload = {**data, "action": "buy"}
-                    spread_guard = enforce_entry_spread_guard(entry_payload, instrument)
-                    if not spread_guard.get("ok", False):
-                        return tv_response({"ok": False, "action": action, "instrument": instrument, "target": target, "blocked_new_entry": True, "result": spread_guard})
-                    units, sizing = choose_units(entry_payload, instrument, "buy")
-                    sizing["entrySpreadGuard"] = spread_guard
-                    sizing["newYorkTime"] = ny_now
-                    status, body = strict_synced_entry("buy", instrument, units, sizing, policy="sync")
-                elif target in {"sell", "short"}:
-                    entry_payload = {**data, "action": "sell"}
-                    spread_guard = enforce_entry_spread_guard(entry_payload, instrument)
-                    if not spread_guard.get("ok", False):
-                        return tv_response({"ok": False, "action": action, "instrument": instrument, "target": target, "blocked_new_entry": True, "result": spread_guard})
-                    units, sizing = choose_units(entry_payload, instrument, "sell")
-                    sizing["entrySpreadGuard"] = spread_guard
-                    sizing["newYorkTime"] = ny_now
-                    status, body = strict_synced_entry("sell", instrument, units, sizing, policy="sync")
+            last_time = None
+            for c in candles:
+                t = pd.Timestamp(c["time"])
+                if t.tzinfo is None:
+                    t = t.tz_localize("UTC")
                 else:
-                    return hard_error({"ok": False, "error": "bad_flip_target", "target": target}, 400)
-                return tv_response({"ok": status < 300 and body.get("ok", False), "action": action, "instrument": instrument, "target": target, "broker_status": status, "result": body})
+                    t = t.tz_convert("UTC")
+                if t.to_pydatetime() > end:
+                    continue
+                m = c.get("mid") or {}
+                rows.append({
+                    "time": t,
+                    "open": float(m.get("o", "nan")),
+                    "high": float(m.get("h", "nan")),
+                    "low": float(m.get("l", "nan")),
+                    "close": float(m.get("c", "nan")),
+                    "volume": int(c.get("volume", 0) or 0),
+                    "complete": bool(c.get("complete", False)),
+                })
+                last_time = t
+
+            if last_time is None:
+                break
+            nxt = last_time.to_pydatetime() + timedelta(seconds=step_sec)
+            if nxt <= cursor:
+                break
+            cursor = nxt
+            if len(candles) < 5000 and last_time.to_pydatetime() >= end - timedelta(seconds=step_sec):
+                break
+
+        if not rows:
+            raise RuntimeError(f"No {granularity} candles returned for {instrument}")
+
+        df = (
+            pd.DataFrame(rows)
+            .drop_duplicates("time", keep="last")
+            .sort_values("time")
+            .reset_index(drop=True)
+        )
+        df.to_csv(cache, index=False, compression="gzip")
+        return df
 
 
-        return hard_error({"ok": False, "error": "unsupported_action", "action": action}, 400)
+# ─────────────────────────────────────────────────────────────────────────────
+# Pine rail math
+# ─────────────────────────────────────────────────────────────────────────────
 
-    except ValueError as e:
-        return hard_error({"ok": False, "error": str(e), "payload": data}, 400)
-    except requests.RequestException as e:
-        return tv_response({"ok": False, "error": "oanda_request_exception", "detail": str(e)}, 200)
-    except Exception as e:
-        app.logger.exception("Unhandled webhook error")
-        return tv_response({"ok": False, "error": "unhandled_exception", "detail": str(e)}, 200)
+def ema_np(x: np.ndarray, n: int) -> np.ndarray:
+    out = np.full(x.shape, np.nan, dtype=np.float64)
+    if len(x) == 0:
+        return out
+    alpha = 2.0 / (n + 1.0)
+    # Warm seed. With the large historical warmup this converges before evaluation.
+    seed = np.nan
+    for i in range(len(x)):
+        v = x[i]
+        if not np.isfinite(v):
+            continue
+        if not np.isfinite(seed):
+            seed = v
+        else:
+            seed = alpha * v + (1.0 - alpha) * seed
+        out[i] = seed
+    return out
+
+
+def wma_np(x: np.ndarray, n: int) -> np.ndarray:
+    out = np.full(x.shape, np.nan, dtype=np.float64)
+    if n <= 0:
+        return out
+    w = np.arange(1.0, n + 1.0, dtype=np.float64)
+    den = w.sum()
+    for i in range(n - 1, len(x)):
+        win = x[i - n + 1 : i + 1]
+        if np.all(np.isfinite(win)):
+            out[i] = np.dot(win, w) / den
+    return out
+
+
+def linreg_np(x: np.ndarray, n: int) -> np.ndarray:
+    """Pine ta.linreg(source, length, 0): fitted value at x=n-1."""
+    out = np.full(x.shape, np.nan, dtype=np.float64)
+    if n <= 1:
+        out[:] = x
+        return out
+    xs = np.arange(n, dtype=np.float64)
+    sx = xs.sum()
+    sxx = np.dot(xs, xs)
+    den = n * sxx - sx * sx
+    for i in range(n - 1, len(x)):
+        y = x[i - n + 1 : i + 1]
+        if not np.all(np.isfinite(y)):
+            continue
+        sy = y.sum()
+        sxy = np.dot(xs, y)
+        slope = (n * sxy - sx * sy) / den
+        intercept = (sy - slope * sx) / n
+        out[i] = intercept + slope * (n - 1)
+    return out
+
+
+def hma_np(x: np.ndarray, n: int) -> np.ndarray:
+    half = max(1, int(math.floor(n / 2.0 + 0.5)))
+    root = max(1, int(math.floor(math.sqrt(n) + 0.5)))
+    a = wma_np(x, half)
+    b = wma_np(x, n)
+    raw = 2.0 * a - b
+    return wma_np(raw, root)
+
+
+def rail_np(close: np.ndarray, family: str, length: int) -> np.ndarray:
+    if family == "EMA":
+        return ema_np(close, length)
+    if family == "HMA":
+        return hma_np(close, length)
+    if family == "KS":
+        return linreg_np(close, length)
+    if family == "WMA":
+        return wma_np(close, length)
+    raise ValueError(f"Unknown rail family {family}")
+
+
+def daily_execution_frame(d_all: pd.DataFrame) -> pd.DataFrame:
+    """
+    Keep complete Daily candles that have a following Daily timestamp.
+    The following timestamp is the current candle's close boundary.
+    """
+    d = d_all.sort_values("time").reset_index(drop=True).copy()
+    d["next_time"] = d["time"].shift(-1)
+    mask = d["complete"].astype(bool) & d["next_time"].notna()
+    d = d.loc[mask].copy().reset_index(drop=True)
+    d["bar_open_ns"] = d["time"].astype("int64")
+    d["bar_close_ns"] = d["next_time"].astype("int64")
+    return d
+
+
+def sample_source_to_daily(
+    source: pd.DataFrame,
+    rail: np.ndarray,
+    daily: pd.DataFrame,
+    granularity: str,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Emulate request.security(..., lookahead_off) on a Daily chart.
+
+    For D, current source rail is the same Daily candle; inverse is previous D rail.
+    For M15/M5/M1, use the final completed source candle inside each Daily candle;
+    inverse is the source rail one source bar earlier.
+    """
+    n = len(daily)
+    cur = np.full(n, np.nan, dtype=np.float64)
+    inv = np.full(n, np.nan, dtype=np.float64)
+
+    if granularity == "D":
+        src = source.sort_values("time").reset_index(drop=True)
+        time_to_idx = {int(t.value): i for i, t in enumerate(pd.to_datetime(src["time"], utc=True))}
+        for j in range(n):
+            k = time_to_idx.get(int(pd.Timestamp(daily.loc[j, "time"]).value), -1)
+            if k >= 0:
+                cur[j] = rail[k]
+                if k > 0:
+                    inv[j] = rail[k - 1]
+        return cur, inv
+
+    sec_map = {"M1": 60, "M5": 300, "M15": 900}
+    dur_ns = sec_map[granularity] * 1_000_000_000
+
+    src = source.sort_values("time").reset_index(drop=True)
+    src_start = pd.to_datetime(src["time"], utc=True).astype("int64").to_numpy()
+    # Complete source candles only.
+    complete = src["complete"].astype(bool).to_numpy()
+    valid_idx = np.flatnonzero(complete)
+    valid_start = src_start[valid_idx]
+
+    for j in range(n):
+        boundary = int(daily.loc[j, "bar_close_ns"])
+        latest_start = boundary - dur_ns
+        pos = np.searchsorted(valid_start, latest_start, side="right") - 1
+        if pos >= 0:
+            k = int(valid_idx[pos])
+            cur[j] = rail[k]
+            if k > 0:
+                inv[j] = rail[k - 1]
+    return cur, inv
+
+
+def candidate_daily_arrays(
+    source: pd.DataFrame,
+    daily: pd.DataFrame,
+    granularity: str,
+    cfgs: List[RailCfg],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Return candidate x day:
+      event_type: +1 valley / -1 peak / 0
+      turn_price: inverse rail at event
+      raw_dir:    +1 / -1 / 0
+    """
+    close = source["close"].to_numpy(dtype=np.float64)
+    nc, nd = len(cfgs), len(daily)
+    evt = np.zeros((nc, nd), dtype=np.int8)
+    price = np.full((nc, nd), np.nan, dtype=np.float64)
+    direction = np.zeros((nc, nd), dtype=np.int8)
+
+    for ci, cfg in enumerate(cfgs):
+        r = rail_np(close, cfg.family, cfg.length)
+        cur, inv = sample_source_to_daily(source, r, daily, granularity)
+        d = np.where(np.isfinite(cur) & np.isfinite(inv),
+                     np.where(cur > inv, 1, np.where(cur < inv, -1, 0)), 0).astype(np.int8)
+        direction[ci] = d
+
+        for t in range(1, nd):
+            if not (np.isfinite(cur[t]) and np.isfinite(inv[t]) and
+                    np.isfinite(cur[t-1]) and np.isfinite(inv[t-1])):
+                continue
+            up = cur[t] > inv[t] and cur[t-1] <= inv[t-1]
+            dn = cur[t] < inv[t] and cur[t-1] >= inv[t-1]
+            if up:
+                evt[ci, t] = 1
+                price[ci, t] = inv[t]
+            elif dn:
+                evt[ci, t] = -1
+                price[ci, t] = inv[t]
+    return evt, price, direction
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Joint simulator — RAW / Any Route R / One Leg Only
+# ─────────────────────────────────────────────────────────────────────────────
+
+@njit(cache=True)
+def _find_target(reg_price, reg_type, reg_bar, reg_count, wanted_type, current_event_bar):
+    for k in range(reg_count - 1, -1, -1):
+        if reg_bar[k] < current_event_bar and reg_type[k] == wanted_type:
+            return reg_price[k]
+    return np.nan
+
+
+@njit(cache=True)
+def _push_turn(reg_price, reg_type, reg_bar, reg_count, price, typ, event_bar):
+    if reg_count < REGISTRY_LIMIT:
+        reg_price[reg_count] = price
+        reg_type[reg_count] = typ
+        reg_bar[reg_count] = event_bar
+        return reg_count + 1
+
+    # Pine shifts the oldest after pushing beyond limit: preserve latest 27.
+    for k in range(REGISTRY_LIMIT - 1):
+        reg_price[k] = reg_price[k + 1]
+        reg_type[k] = reg_type[k + 1]
+        reg_bar[k] = reg_bar[k + 1]
+    reg_price[REGISTRY_LIMIT - 1] = price
+    reg_type[REGISTRY_LIMIT - 1] = typ
+    reg_bar[REGISTRY_LIMIT - 1] = event_bar
+    return REGISTRY_LIMIT
+
+
+@njit(cache=True)
+def _simulate_one(
+    c0, c1, c2, c3,
+    e0, p0, d0,
+    e1, p1, d1,
+    e2, p2, d2,
+    e3, p3, d3,
+    o, h, l, c,
+    open_ns, close_ns,
+    eval_start_ns, fwd_start_ns,
+    pip,
+):
+    nd = len(c)
+
+    reg_price = np.empty(REGISTRY_LIMIT, dtype=np.float64)
+    reg_type = np.empty(REGISTRY_LIMIT, dtype=np.int8)
+    reg_bar = np.empty(REGISTRY_LIMIT, dtype=np.int32)
+    reg_count = 0
+
+    position = 0
+    entry_price = 0.0
+    target = np.nan
+    entry_day = -1
+    entry_time_ns = 0
+    mae_pips = 0.0
+
+    pending_dir = 0
+    pending_target = np.nan
+    pending_signal_day = -1
+
+    guard_meaningful = 0
+
+    entries_total = 0
+    closed_total = 0
+    wins_total = 0
+    net_total = 0.0
+    max_mae_total = 0.0
+    longest_total = 0.0
+    hold_sum_total = 0.0
+
+    entries_fwd = 0
+    closed_fwd = 0
+    wins_fwd = 0
+    net_fwd = 0.0
+
+    for t in range(nd):
+        # Current raw directions.
+        trigger_dir = int(d0[c0, t])
+        g_now = int(d1[c1, t])
+        if g_now != 0:
+            guard_meaningful = g_now
+        guardian_dir = guard_meaningful
+
+        # Orders submitted on previous Daily close fill this Daily open.
+        if pending_dir != 0 and t > pending_signal_day and position == 0:
+            position = pending_dir
+            entry_price = o[t]
+            target = pending_target
+            entry_day = t
+            entry_time_ns = open_ns[t]
+            mae_pips = 0.0
+            if open_ns[t] >= eval_start_ns:
+                entries_total += 1
+            if open_ns[t] >= fwd_start_ns:
+                entries_fwd += 1
+            pending_dir = 0
+            pending_target = np.nan
+            pending_signal_day = -1
+
+        # Store every new raw R turn BEFORE target selection, same source order as Pine.
+        event_types = np.empty(4, dtype=np.int8)
+        event_prices = np.empty(4, dtype=np.float64)
+        event_count = 0
+
+        typ = int(e0[c0, t])
+        if typ != 0:
+            pr = p0[c0, t]
+            reg_count = _push_turn(reg_price, reg_type, reg_bar, reg_count, pr, typ, t - 1)
+            event_types[event_count] = typ
+            event_prices[event_count] = pr
+            event_count += 1
+
+        typ = int(e1[c1, t])
+        if typ != 0:
+            pr = p1[c1, t]
+            reg_count = _push_turn(reg_price, reg_type, reg_bar, reg_count, pr, typ, t - 1)
+            event_types[event_count] = typ
+            event_prices[event_count] = pr
+            event_count += 1
+
+        typ = int(e2[c2, t])
+        if typ != 0:
+            pr = p2[c2, t]
+            reg_count = _push_turn(reg_price, reg_type, reg_bar, reg_count, pr, typ, t - 1)
+            event_types[event_count] = typ
+            event_prices[event_count] = pr
+            event_count += 1
+
+        typ = int(e3[c3, t])
+        if typ != 0:
+            pr = p3[c3, t]
+            reg_count = _push_turn(reg_price, reg_type, reg_bar, reg_count, pr, typ, t - 1)
+            event_types[event_count] = typ
+            event_prices[event_count] = pr
+            event_count += 1
+
+        # Open-trade MAE + target market close.
+        exited_today = False
+        if position != 0:
+            adverse = (entry_price - l[t]) / pip if position == 1 else (h[t] - entry_price) / pip
+            if adverse > mae_pips:
+                mae_pips = adverse
+
+            reached = (c[t] >= target) if position == 1 else (c[t] <= target)
+            if reached:
+                exit_price = c[t]
+                pnl_pips = ((exit_price - entry_price) / pip) if position == 1 else ((entry_price - exit_price) / pip)
+                hold_days = (close_ns[t] - entry_time_ns) / 86_400_000_000_000.0
+
+                if close_ns[t] >= eval_start_ns:
+                    closed_total += 1
+                    if pnl_pips > 0:
+                        wins_total += 1
+                    net_total += pnl_pips
+                    if mae_pips > max_mae_total:
+                        max_mae_total = mae_pips
+                    if hold_days > longest_total:
+                        longest_total = hold_days
+                    hold_sum_total += hold_days
+
+                if close_ns[t] >= fwd_start_ns:
+                    closed_fwd += 1
+                    if pnl_pips > 0:
+                        wins_fwd += 1
+                    net_fwd += pnl_pips
+
+                position = 0
+                entry_price = 0.0
+                target = np.nan
+                entry_day = -1
+                entry_time_ns = 0
+                mae_pips = 0.0
+                exited_today = True
+
+        # One Leg Only: no same-Daily-bar re-entry after payment.
+        if close_ns[t] < eval_start_ns:
+            continue
+        if position != 0 or pending_dir != 0 or exited_today:
+            continue
+
+        # New finalized R rays. Process in R2,R8,R9,R10 storage order.
+        # Candidate direction is ray type: valley=long(+1), peak=short(-1).
+        for ei in range(event_count):
+            et = int(event_types[ei])
+            candidate_dir = 1 if et == 1 else -1
+
+            # RAW qualification:
+            # selected Guardian must agree/intact; selected Trigger must agree.
+            if candidate_dir != guardian_dir or candidate_dir != trigger_dir:
+                continue
+
+            tgt = _find_target(
+                reg_price, reg_type, reg_bar, reg_count,
+                -et, t - 1
+            )
+            if not np.isfinite(tgt):
+                continue
+
+            target_valid = (tgt > c[t]) if candidate_dir == 1 else (tgt < c[t])
+            if not target_valid:
+                continue
+
+            pending_dir = candidate_dir
+            pending_target = tgt
+            pending_signal_day = t
+            break
+
+    open_end = 1 if (position != 0 or pending_dir != 0) else 0
+    avg_hold = hold_sum_total / closed_total if closed_total > 0 else 9999.0
+
+    out = np.empty(13, dtype=np.float64)
+    out[0] = entries_total
+    out[1] = closed_total
+    out[2] = wins_total
+    out[3] = net_total
+    out[4] = max_mae_total
+    out[5] = longest_total
+    out[6] = avg_hold
+    out[7] = entries_fwd
+    out[8] = closed_fwd
+    out[9] = wins_fwd
+    out[10] = net_fwd
+    out[11] = open_end
+    out[12] = (closed_total / entries_total * 100.0) if entries_total > 0 else 0.0
+    return out
+
+
+@njit(parallel=True, cache=True)
+def simulate_many(
+    combos,
+    e0, p0, d0,
+    e1, p1, d1,
+    e2, p2, d2,
+    e3, p3, d3,
+    o, h, l, c,
+    open_ns, close_ns,
+    eval_start_ns, fwd_start_ns,
+    pip,
+):
+    n = combos.shape[0]
+    out = np.empty((n, 13), dtype=np.float64)
+    for i in prange(n):
+        out[i] = _simulate_one(
+            combos[i,0], combos[i,1], combos[i,2], combos[i,3],
+            e0,p0,d0,e1,p1,d1,e2,p2,d2,e3,p3,d3,
+            o,h,l,c,open_ns,close_ns,eval_start_ns,fwd_start_ns,pip
+        )
+    return out
+
+
+def coarse_cfgs(lengths: Tuple[int, ...]) -> Dict[str, List[RailCfg]]:
+    c = [RailCfg(f, n) for f in FAMILIES for n in lengths]
+    return {slot: list(c) for slot in SLOT_ORDER}
+
+
+def cfg_index(cfgs: List[RailCfg], wanted: Tuple[str,int]) -> int:
+    for i, c in enumerate(cfgs):
+        if c.family == wanted[0] and c.length == wanted[1]:
+            return i
+    raise ValueError(f"Baseline {wanted} not found in candidate bank")
+
+
+def cartesian_indices(cfgs: Dict[str, List[RailCfg]]) -> np.ndarray:
+    dims = [range(len(cfgs[s])) for s in SLOT_ORDER]
+    return np.asarray(list(itertools.product(*dims)), dtype=np.int16)
+
+
+def metric_dict(row: np.ndarray) -> dict:
+    return {
+        "entries_120d": int(row[0]),
+        "closed_120d": int(row[1]),
+        "wins_120d": int(row[2]),
+        "win_pct_120d": (row[2] / row[1] * 100.0) if row[1] > 0 else 0.0,
+        "net_pips_120d": float(row[3]),
+        "max_mae_pips_120d": float(row[4]),
+        "longest_days_120d": float(row[5]),
+        "avg_hold_days_120d": float(row[6]),
+        "entries_30d": int(row[7]),
+        "closed_30d": int(row[8]),
+        "wins_30d": int(row[9]),
+        "win_pct_30d": (row[9] / row[8] * 100.0) if row[8] > 0 else 0.0,
+        "net_pips_30d": float(row[10]),
+        "open_or_pending_end": int(row[11]),
+        "completion_pct_120d": float(row[12]),
+    }
+
+
+def rank_indices(metrics: np.ndarray) -> np.ndarray:
+    closed = metrics[:,1]
+    wins = metrics[:,2]
+    fclosed = metrics[:,8]
+    fwins = metrics[:,9]
+    wr = np.where(closed > 0, wins / np.maximum(closed,1) * 100.0, 0.0)
+    fwr = np.where(fclosed > 0, fwins / np.maximum(fclosed,1) * 100.0, 0.0)
+
+    quality = np.zeros(len(metrics), dtype=np.int16)
+    quality[(wr >= 90.0) & (fwr >= 90.0)] = 1
+    quality[(wr >= 95.0) & (fwr >= 95.0)] = 2
+    quality[(wr >= 99.999) & (fwr >= 99.999)] = 3
+
+    # lexsort: last key is primary. Negative = descending.
+    order = np.lexsort((
+        metrics[:,5],                  # lower longest
+        metrics[:,4],                  # lower MAE
+        -metrics[:,3],                 # total pips
+        -metrics[:,10],                # 30d pips
+        metrics[:,11],                 # prefer no open/pending end
+        -closed,                       # total closed
+        -fclosed,                      # 30d closed
+        -quality,                      # accuracy tier
+    ))
+    return order
+
+
+def build_top_rows(
+    combos: np.ndarray,
+    metrics: np.ndarray,
+    cfgs: Dict[str, List[RailCfg]],
+    top_n: int,
+) -> pd.DataFrame:
+    order = rank_indices(metrics)[:top_n]
+    rows = []
+    for rank, ix in enumerate(order, 1):
+        combo = combos[ix]
+        m = metric_dict(metrics[ix])
+        row = {"rank": rank}
+        for si, slot in enumerate(SLOT_ORDER):
+            cfg = cfgs[slot][int(combo[si])]
+            row[f"{slot}_family"] = cfg.family
+            row[f"{slot}_length"] = cfg.length
+            row[f"{slot}_config"] = cfg.label() + " RAW"
+        row.update(m)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def local_refine(
+    seed_df: pd.DataFrame,
+    radius: int,
+    max_len: int,
+) -> Dict[str, List[RailCfg]]:
+    banks = {}
+    for slot in SLOT_ORDER:
+        seen = set()
+        arr = []
+        for _, row in seed_df.iterrows():
+            fam = str(row[f"{slot}_family"])
+            n = int(row[f"{slot}_length"])
+            for ln in range(max(2, n-radius), min(max_len, n+radius)+1):
+                key=(fam,ln)
+                if key not in seen:
+                    seen.add(key)
+                    arr.append(RailCfg(fam,ln))
+        # Always preserve baseline candidate in bank.
+        b = BASELINE[slot]
+        key=(b[0],b[1])
+        if key not in seen:
+            arr.append(RailCfg(*b))
+        banks[slot]=arr
+    return banks
+
+
+def local_combo_union(
+    seed_df: pd.DataFrame,
+    cfgs: Dict[str,List[RailCfg]],
+    radius: int,
+    max_len: int,
+) -> np.ndarray:
+    maps = {
+        s: {(c.family,c.length): i for i,c in enumerate(cfgs[s])}
+        for s in SLOT_ORDER
+    }
+    combos = set()
+    for _, row in seed_df.iterrows():
+        per_slot=[]
+        for slot in SLOT_ORDER:
+            fam=str(row[f"{slot}_family"])
+            n=int(row[f"{slot}_length"])
+            vals=[]
+            for ln in range(max(2,n-radius),min(max_len,n+radius)+1):
+                ix=maps[slot].get((fam,ln))
+                if ix is not None:
+                    vals.append(ix)
+            per_slot.append(vals)
+        for tup in itertools.product(*per_slot):
+            combos.add(tuple(int(x) for x in tup))
+    # Baseline too.
+    combos.add(tuple(cfg_index(cfgs[s], BASELINE[s]) for s in SLOT_ORDER))
+    return np.asarray(sorted(combos),dtype=np.int16)
+
+
+def prepare_banks(
+    raw: Dict[str,pd.DataFrame],
+    daily: pd.DataFrame,
+    cfgs: Dict[str,List[RailCfg]],
+):
+    out=[]
+    for slot in SLOT_ORDER:
+        gran=SLOT_TF[slot]
+        evt, price, direction = candidate_daily_arrays(raw[gran], daily, gran, cfgs[slot])
+        out.append((evt,price,direction))
+    return out
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="TGIM joint R2/R8/R9/R10 rail-family + length sweeper."
+    )
+    ap.add_argument("--instrument", default="EUR_USD")
+    ap.add_argument("--env", choices=["practice","live"],
+                    default=os.getenv("OANDA_ENV","practice"))
+    ap.add_argument("--token", default=os.getenv("OANDA_TOKEN",""))
+    ap.add_argument("--history-days", type=int, default=180,
+                    help="OANDA history to fetch. 180 gives 120d evaluation plus registry warmup.")
+    ap.add_argument("--eval-days", type=int, default=120)
+    ap.add_argument("--forward-days", type=int, default=30)
+    ap.add_argument("--lengths", default="5,8,13,21,27,34")
+    ap.add_argument("--top", type=int, default=100)
+    ap.add_argument("--refine-top", type=int, default=12,
+                    help="0 disables local exact-length refinement.")
+    ap.add_argument("--refine-radius", type=int, default=4)
+    ap.add_argument("--max-refine-length", type=int, default=60)
+    ap.add_argument("--expected-total", type=int, default=None)
+    ap.add_argument("--force-sweep", action="store_true",
+                    help="Rank even when BASE does not certify. Use only diagnostically.")
+    ap.add_argument("--refresh", action="store_true")
+    ap.add_argument("--cache-dir", default="./tgim_sweeper_cache")
+    ap.add_argument("--output-dir", default="./tgim_sweeper_results")
+    args = ap.parse_args()
+
+    instrument=instrument_norm(args.instrument)
+    lengths=tuple(sorted({int(x.strip()) for x in args.lengths.split(",") if x.strip()}))
+    for slot,b in BASELINE.items():
+        if b[1] not in lengths:
+            raise SystemExit(
+                f"Length bank must include baseline {slot} length {b[1]}. "
+                f"Current --lengths={lengths}"
+            )
+
+    cache_dir=Path(args.cache_dir)
+    result_dir=Path(args.output_dir) / instrument / datetime.now().strftime("%Y%m%d_%H%M%S")
+    result_dir.mkdir(parents=True,exist_ok=True)
+
+    end=datetime.now(timezone.utc)+timedelta(days=2)
+    start=end-timedelta(days=args.history_days+5)
+
+    print(f"[1/7] Fetching/caching OANDA {instrument} D/M15/M5/M1 ...")
+    client=OandaHistory(args.token,args.env,cache_dir)
+    raw={}
+    for gran in ("D","M15","M5","M1"):
+        print(f"      {gran} ...",flush=True)
+        raw[gran]=client.candles(instrument,gran,start,end,refresh=args.refresh)
+
+    daily=daily_execution_frame(raw["D"])
+    if len(daily)<40:
+        raise SystemExit("Not enough complete Daily candles.")
+
+    last_bar_open_ns=int(daily["bar_open_ns"].iloc[-1])
+    eval_start_ns=last_bar_open_ns-args.eval_days*86_400_000_000_000
+    fwd_start_ns=last_bar_open_ns-args.forward_days*86_400_000_000_000
+
+    print(f"[2/7] Building {len(lengths)*len(FAMILIES)} candidates per R bay ...")
+    cfgs=coarse_cfgs(lengths)
+    banks=prepare_banks(raw,daily,cfgs)
+
+    base_combo=np.asarray([[
+        cfg_index(cfgs[s],BASELINE[s]) for s in SLOT_ORDER
+    ]],dtype=np.int16)
+
+    o=daily["open"].to_numpy(np.float64)
+    h=daily["high"].to_numpy(np.float64)
+    l=daily["low"].to_numpy(np.float64)
+    c=daily["close"].to_numpy(np.float64)
+    ons=daily["bar_open_ns"].to_numpy(np.int64)
+    cns=daily["bar_close_ns"].to_numpy(np.int64)
+    pip=pip_size(instrument)
+
+    print("[3/7] BASE certification ...")
+    bm=simulate_many(
+        base_combo,
+        *banks[0],*banks[1],*banks[2],*banks[3],
+        o,h,l,c,ons,cns,eval_start_ns,fwd_start_ns,pip
+    )[0]
+    base_metrics=metric_dict(bm)
+    expected=args.expected_total
+    if expected is None:
+        expected=EXPECTED_TOTAL.get(instrument)
+
+    print("      BASE:",
+          " | ".join(f"{s} {BASELINE[s][0]}{BASELINE[s][1]} RAW" for s in SLOT_ORDER))
+    print(f"      120d closed/wins: {base_metrics['closed_120d']}/{base_metrics['wins_120d']}")
+    print(f"      30d  closed/wins: {base_metrics['closed_30d']}/{base_metrics['wins_30d']}")
+    print(f"      MAE: {base_metrics['max_mae_pips_120d']:.2f} pips"
+          f" | longest: {base_metrics['longest_days_120d']:.2f}d"
+          f" | net: {base_metrics['net_pips_120d']:.1f} pips")
+
+    certified = (
+        expected is None or
+        (base_metrics["closed_120d"] == expected and
+         base_metrics["wins_120d"] == expected)
+    )
+    cert = {
+        "instrument":instrument,
+        "expected_total_closed":expected,
+        "baseline":{s:{"family":BASELINE[s][0],"length":BASELINE[s][1],"working":"RAW"}
+                    for s in SLOT_ORDER},
+        "metrics":base_metrics,
+        "certified":bool(certified),
+        "note":"TradingView remains final verifier. Exact OANDA-vs-TradingView candle alignment can expose a residual mismatch."
+    }
+    (result_dir/"BASE_CERTIFICATION.json").write_text(json.dumps(cert,indent=2))
+
+    if not certified and not args.force_sweep:
+        print("\nBASE MISMATCH — SWEEP ABORTED.")
+        print(f"TradingView reference for {instrument}: {expected} closed wins; "
+              f"Python got {base_metrics['closed_120d']}.")
+        print("The engine is doing its job: it will not optimize a mismatched model.")
+        print(f"Send BASE_CERTIFICATION.json back for parity diagnosis: {result_dir}")
+        return 2
+
+    print("[4/7] Creating full joint Cartesian grid ...")
+    combos=cartesian_indices(cfgs)
+    print(f"      {len(combos):,} complete four-rail systems.")
+
+    print("[5/7] Running coarse joint sweep (Numba parallel) ...")
+    t0=time.time()
+    metrics=simulate_many(
+        combos,
+        *banks[0],*banks[1],*banks[2],*banks[3],
+        o,h,l,c,ons,cns,eval_start_ns,fwd_start_ns,pip
+    )
+    print(f"      done in {time.time()-t0:.1f}s")
+
+    top=build_top_rows(combos,metrics,cfgs,args.top)
+    top.to_csv(result_dir/"TOP_COARSE.csv",index=False)
+    np.savez_compressed(result_dir/"COARSE_METRICS.npz",combos=combos,metrics=metrics)
+
+    final_top=top.copy()
+    if args.refine_top>0:
+        print(f"[6/7] Local exact-length refinement around top {args.refine_top} coarse systems ...")
+        seeds=top.head(args.refine_top)
+        rcfg=local_refine(seeds,args.refine_radius,args.max_refine_length)
+        rbanks=prepare_banks(raw,daily,rcfg)
+        rcombos=local_combo_union(seeds,rcfg,args.refine_radius,args.max_refine_length)
+        print(f"      {len(rcombos):,} local joint systems.")
+        rm=simulate_many(
+            rcombos,
+            *rbanks[0],*rbanks[1],*rbanks[2],*rbanks[3],
+            o,h,l,c,ons,cns,eval_start_ns,fwd_start_ns,pip
+        )
+        rtop=build_top_rows(rcombos,rm,rcfg,args.top)
+        rtop.to_csv(result_dir/"TOP_REFINED.csv",index=False)
+        np.savez_compressed(result_dir/"REFINED_METRICS.npz",combos=rcombos,metrics=rm)
+        final_top=rtop
+
+    print("[7/7] Writing promotion package ...")
+    final_top.to_csv(result_dir/"TOP_FOR_TRADINGVIEW_VERIFICATION.csv",index=False)
+    winner_json=[]
+    for _,row in final_top.head(20).iterrows():
+        winner_json.append({
+            "rank":int(row["rank"]),
+            "R2":{"tf":"1D","family":row["R2_family"],"length":int(row["R2_length"]),"working":"RAW","role":"TRIGGER"},
+            "R8":{"tf":"15m","family":row["R8_family"],"length":int(row["R8_length"]),"working":"RAW","role":"GUARD"},
+            "R9":{"tf":"5m","family":row["R9_family"],"length":int(row["R9_length"]),"working":"RAW","role":"ROUTE"},
+            "R10":{"tf":"1m","family":row["R10_family"],"length":int(row["R10_length"]),"working":"RAW","role":"ROUTE"},
+            "closed_30d":int(row["closed_30d"]),
+            "wins_30d":int(row["wins_30d"]),
+            "closed_120d":int(row["closed_120d"]),
+            "wins_120d":int(row["wins_120d"]),
+            "net_pips_30d":float(row["net_pips_30d"]),
+            "net_pips_120d":float(row["net_pips_120d"]),
+            "max_mae_pips_120d":float(row["max_mae_pips_120d"]),
+            "longest_days_120d":float(row["longest_days_120d"]),
+            "open_or_pending_end":int(row["open_or_pending_end"]),
+        })
+    (result_dir/"TOP20_PROMOTION.json").write_text(json.dumps(winner_json,indent=2))
+
+    print("\nTOP 10")
+    cols=[
+        "rank","R2_config","R8_config","R9_config","R10_config",
+        "closed_30d","wins_30d","closed_120d","wins_120d",
+        "max_mae_pips_120d","longest_days_120d","net_pips_120d"
+    ]
+    print(final_top[cols].head(10).to_string(index=False))
+    print(f"\nResults: {result_dir}")
+    print("Next step: verify TOP20_PROMOTION.json candidates in the actual Pine strategy.")
+    return 0
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8080"))
-    app.run(host="0.0.0.0", port=port)
+    raise SystemExit(main())
