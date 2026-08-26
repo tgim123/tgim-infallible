@@ -2,3 +2,6 @@ flask
 requests
 python-dotenv
 gunicorn
+numpy>=2.0
+pandas>=2.0
+numba>=0.60
