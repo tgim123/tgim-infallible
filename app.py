@@ -1,4 +1,4 @@
-# TGIM OANDA Dynamic Margin + Spread Webhook v7.1 — Spread Lock
+# TGIM OANDA Dynamic Margin + Spread Webhook v7.2 — Portfolio Slot + Rollover Lock
 # ------------------------------------------------------------
 # Drop-in replacement for app.py on Render.
 # OANDA-only.
@@ -16,6 +16,11 @@
 #   TGIM_MARGIN_RETRY=2
 #   TGIM_MAX_SPREAD_PIPS=4          # hard block new entries/flips when live spread is > this value; 0/off disables
 #   TGIM_SPREAD_BUFFER_PIPS=0       # optional extra reserve in sizing math
+#   TGIM_PORTFOLIO_SLOT_MODE=true
+#   TGIM_MAX_PORTFOLIO_MARGIN_PCT=30
+#   TGIM_MAX_CONCURRENT_POSITIONS=3
+#   TGIM_BLOCK_NY_5PM_HOUR=true
+#   TGIM_RESPECT_PAYLOAD_RISK_PCT_IN_SLOT_MODE=false
 #
 # Main protections:
 #   1) No hedge: opposite side must close and verify before new side opens.
@@ -29,6 +34,8 @@ from __future__ import annotations
 import json
 import os
 import time
+import threading
+from zoneinfo import ZoneInfo
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP, getcontext
 from typing import Any, Dict, Optional, Tuple
 
@@ -68,6 +75,24 @@ ALLOW_ADD_SAME_SIDE = os.environ.get("TGIM_ALLOW_ADD_SAME_SIDE", "false").strip(
 MARGIN_RETRY = int(os.environ.get("TGIM_MARGIN_RETRY", "2"))
 MAX_SPREAD_PIPS = Decimal(os.environ.get("TGIM_MAX_SPREAD_PIPS", "4"))
 SPREAD_BUFFER_PIPS = Decimal(os.environ.get("TGIM_SPREAD_BUFFER_PIPS", "0"))
+
+# v7.2 portfolio-slot architecture.
+PORTFOLIO_SLOT_MODE = os.environ.get("TGIM_PORTFOLIO_SLOT_MODE", "true").strip().lower() == "true"
+MAX_PORTFOLIO_MARGIN_PCT = Decimal(os.environ.get("TGIM_MAX_PORTFOLIO_MARGIN_PCT", "30"))
+MAX_CONCURRENT_POSITIONS = max(1, int(os.environ.get("TGIM_MAX_CONCURRENT_POSITIONS", "3")))
+BLOCK_NY_5PM_HOUR = os.environ.get("TGIM_BLOCK_NY_5PM_HOUR", "true").strip().lower() == "true"
+NY_TZ = ZoneInfo("America/New_York")
+
+# The current Pine payload still sends risk_pct=1.8 because that number belongs to
+# its historical Strategy Tester model. In portfolio-slot mode the live backend is
+# authoritative and uses portfolio_cap / max_positions instead.
+RESPECT_PAYLOAD_RISK_PCT_IN_SLOT_MODE = (
+    os.environ.get("TGIM_RESPECT_PAYLOAD_RISK_PCT_IN_SLOT_MODE", "false").strip().lower() == "true"
+)
+
+# Serialize entry/flip processing so simultaneous TradingView alerts cannot all size
+# from the same pre-trade marginAvailable snapshot.
+ENTRY_LOCK = threading.RLock()
 
 # ──────────────────────────────────────────────
 # Generic helpers
@@ -192,14 +217,19 @@ def get_account_snapshot() -> Tuple[int, Dict[str, Any]]:
     if status >= 300:
         return status, {"ok": False, "error": "account_summary_failed", "body": body}
     acct = body.get("account", {})
+    nav = d(acct.get("NAV", acct.get("balance", "0")), "0")
+    balance = d(acct.get("balance", "0"), "0")
+    sizing_equity = min(nav, balance) if nav > 0 and balance > 0 else max(nav, balance)
     return status, {
         "ok": True,
         "currency": acct.get("currency", "USD"),
-        "NAV": str(acct.get("NAV", acct.get("balance", "0"))),
-        "balance": str(acct.get("balance", "0")),
+        "NAV": str(nav),
+        "balance": str(balance),
+        "sizingEquity": str(sizing_equity),
         "marginAvailable": str(acct.get("marginAvailable", "0")),
         "marginUsed": str(acct.get("marginUsed", "0")),
         "unrealizedPL": str(acct.get("unrealizedPL", "0")),
+        "openPositionCount": int(acct.get("openPositionCount", 0) or 0),
         "raw": acct,
     }
 
@@ -329,9 +359,74 @@ def snapshot_position(instrument: str) -> Dict[str, Any]:
     return {"instrument": instrument, "found": found, "long_units": long_units, "short_units": short_units_abs, "raw": raw, "error": err}
 
 # ──────────────────────────────────────────────
+# Portfolio-slot / rollover helpers
+# ──────────────────────────────────────────────
+def ny_rollover_blocked_now() -> Tuple[bool, str]:
+    if not BLOCK_NY_5PM_HOUR:
+        return False, ""
+    now_ny = datetime_now_ny()
+    if now_ny.hour == 17:
+        return True, now_ny.isoformat()
+    return False, now_ny.isoformat()
+
+
+def datetime_now_ny():
+    # Isolated for deterministic testing / monkeypatching.
+    from datetime import datetime
+    return datetime.now(NY_TZ)
+
+
+def portfolio_budget(acct: Dict[str, Any], payload_risk_pct: Decimal) -> Dict[str, Any]:
+    nav = d(acct.get("NAV"), "0")
+    balance = d(acct.get("balance"), "0")
+    sizing_equity = d(acct.get("sizingEquity"), "0")
+    if sizing_equity <= 0:
+        sizing_equity = min(nav, balance) if nav > 0 and balance > 0 else max(nav, balance)
+
+    margin_used = d(acct.get("marginUsed"), "0")
+    margin_available = d(acct.get("marginAvailable"), "0")
+    open_count = int(acct.get("openPositionCount", 0) or 0)
+
+    cap_pct = max(Decimal("0"), MAX_PORTFOLIO_MARGIN_PCT)
+    cap_amount = sizing_equity * cap_pct / Decimal("100")
+    remaining_under_cap = max(Decimal("0"), cap_amount - margin_used)
+
+    slot_pct = cap_pct / Decimal(MAX_CONCURRENT_POSITIONS)
+    if RESPECT_PAYLOAD_RISK_PCT_IN_SLOT_MODE and payload_risk_pct > 0:
+        slot_pct = min(slot_pct, payload_risk_pct)
+    slot_target = sizing_equity * slot_pct / Decimal("100")
+
+    # Never consume more than portfolio headroom or safely available OANDA margin.
+    broker_available_safe = max(Decimal("0"), margin_available * MARGIN_SAFETY)
+    margin_to_use = min(slot_target, remaining_under_cap, broker_available_safe)
+
+    return {
+        "sizingEquity": sizing_equity,
+        "NAV": nav,
+        "balance": balance,
+        "marginUsed": margin_used,
+        "marginAvailable": margin_available,
+        "openPositionCount": open_count,
+        "portfolioCapPct": cap_pct,
+        "portfolioCapAmount": cap_amount,
+        "remainingUnderCap": remaining_under_cap,
+        "slotTargetPct": slot_pct,
+        "slotTargetMargin": slot_target,
+        "brokerAvailableSafe": broker_available_safe,
+        "marginToUse": margin_to_use,
+        "maxConcurrentPositions": MAX_CONCURRENT_POSITIONS,
+    }
+
+
+# ──────────────────────────────────────────────
 # Dynamic sizing
 # ──────────────────────────────────────────────
-def dynamic_units_for_instrument(instrument: str, risk_pct: Decimal, side: str, max_spread_pips_override: Optional[Decimal] = None) -> Tuple[int, Dict[str, Any]]:
+def dynamic_units_for_instrument(
+    instrument: str,
+    risk_pct: Decimal,
+    side: str,
+    max_spread_pips_override: Optional[Decimal] = None
+) -> Tuple[int, Dict[str, Any]]:
     acct_status, acct = get_account_snapshot()
     if acct_status >= 300 or not acct.get("ok"):
         raise RuntimeError(f"account_snapshot_failed: {acct}")
@@ -346,33 +441,69 @@ def dynamic_units_for_instrument(instrument: str, risk_pct: Decimal, side: str, 
         raise RuntimeError(f"market_snapshot_failed: {mkt}")
 
     spread_pips = d(mkt.get("spreadPips"), "0")
-    effective_max_spread_pips = MAX_SPREAD_PIPS
-    if max_spread_pips_override is not None:
-        effective_max_spread_pips = max_spread_pips_override
+
+    # Environment value is a hard ceiling. Payload may tighten it, never loosen it.
+    payload_max = max_spread_pips_override if max_spread_pips_override is not None else Decimal("0")
+    env_max = MAX_SPREAD_PIPS
+    if env_max > 0 and payload_max > 0:
+        effective_max_spread_pips = min(env_max, payload_max)
+    elif env_max > 0:
+        effective_max_spread_pips = env_max
+    else:
+        effective_max_spread_pips = payload_max
 
     if effective_max_spread_pips > 0 and spread_pips > effective_max_spread_pips:
-        raise RuntimeError(f"spread_too_wide: spread_pips={spread_pips} max={effective_max_spread_pips}")
+        raise RuntimeError(
+            f"spread_too_wide: spread_pips={spread_pips} max={effective_max_spread_pips}"
+        )
 
-    nav = d(acct.get("NAV"), "0")
-    margin_avail = d(acct.get("marginAvailable"), "0")
     margin_rate = d(inst.get("marginRate"), "0")
     quote_to_home = d(mkt.get("quoteToHomeConversion"), "1")
     mid = d(mkt.get("mid"), "0")
     pip = d(mkt.get("pipSize"), "0.0001")
 
-    if nav <= 0 or margin_rate <= 0 or mid <= 0:
-        raise RuntimeError(f"bad_sizing_inputs: nav={nav} margin_rate={margin_rate} mid={mid}")
+    if margin_rate <= 0 or mid <= 0:
+        raise RuntimeError(f"bad_sizing_inputs: margin_rate={margin_rate} mid={mid}")
 
-    target_margin = nav * (risk_pct / Decimal("100"))
-    margin_cap = margin_avail * MARGIN_SAFETY
-    margin_to_use = min(target_margin, margin_cap) if margin_avail > 0 else target_margin
+    if PORTFOLIO_SLOT_MODE:
+        budget = portfolio_budget(acct, risk_pct)
+        if budget["openPositionCount"] >= MAX_CONCURRENT_POSITIONS:
+            raise RuntimeError(
+                f"max_concurrent_positions_reached: "
+                f"{budget['openPositionCount']}/{MAX_CONCURRENT_POSITIONS}"
+            )
+        margin_to_use = budget["marginToUse"]
+        if margin_to_use <= 0:
+            raise RuntimeError(
+                f"portfolio_margin_cap_reached: used={budget['marginUsed']} "
+                f"cap={budget['portfolioCapAmount']}"
+            )
+        effective_risk_pct = budget["slotTargetPct"]
+    else:
+        nav = d(acct.get("NAV"), "0")
+        margin_avail = d(acct.get("marginAvailable"), "0")
+        target_margin = nav * (risk_pct / Decimal("100"))
+        margin_cap = margin_avail * MARGIN_SAFETY
+        margin_to_use = min(target_margin, margin_cap) if margin_avail > 0 else target_margin
+        budget = {
+            "sizingEquity": nav,
+            "NAV": nav,
+            "balance": d(acct.get("balance"), "0"),
+            "marginUsed": d(acct.get("marginUsed"), "0"),
+            "marginAvailable": margin_avail,
+            "openPositionCount": int(acct.get("openPositionCount", 0) or 0),
+            "portfolioCapPct": None,
+            "portfolioCapAmount": None,
+            "remainingUnderCap": None,
+            "slotTargetPct": risk_pct,
+            "slotTargetMargin": target_margin,
+            "brokerAvailableSafe": margin_cap,
+            "marginToUse": margin_to_use,
+            "maxConcurrentPositions": None,
+        }
+        effective_risk_pct = risk_pct
 
-    # OANDA margin approximation for account currency:
-    # units * mid price in quote currency * quote-to-home conversion * marginRate.
     margin_per_unit = mid * quote_to_home * margin_rate
-
-    # Optional spread buffer reserve: units * spread_buffer_pips * pip * quote_to_home.
-    # This is intentionally conservative and small by default/off.
     spread_buffer_per_unit = SPREAD_BUFFER_PIPS * pip * quote_to_home
     cost_per_unit = margin_per_unit + spread_buffer_per_unit
     if cost_per_unit <= 0:
@@ -382,16 +513,26 @@ def dynamic_units_for_instrument(instrument: str, risk_pct: Decimal, side: str, 
     units = floor_units(units_raw)
 
     return units, {
-        "mode": "dynamic_margin",
+        "mode": "portfolio_slot_dynamic_margin" if PORTFOLIO_SLOT_MODE else "dynamic_margin",
         "instrument": instrument,
         "side": side,
-        "riskPct": str(risk_pct),
-        "NAV": str(nav),
-        "marginAvailable": str(margin_avail),
-        "marginSafety": str(MARGIN_SAFETY),
-        "targetMargin": str(target_margin),
-        "marginCap": str(margin_cap),
+        "payloadRiskPct": str(risk_pct),
+        "effectiveRiskPct": str(effective_risk_pct),
+        "portfolioSlotMode": PORTFOLIO_SLOT_MODE,
+        "respectPayloadRiskPctInSlotMode": RESPECT_PAYLOAD_RISK_PCT_IN_SLOT_MODE,
+        "sizingEquity": str(budget["sizingEquity"]),
+        "NAV": str(budget["NAV"]),
+        "balance": str(budget["balance"]),
+        "marginAvailable": str(budget["marginAvailable"]),
+        "marginUsed": str(budget["marginUsed"]),
+        "openPositionCount": budget["openPositionCount"],
+        "portfolioCapPct": None if budget["portfolioCapPct"] is None else str(budget["portfolioCapPct"]),
+        "portfolioCapAmount": None if budget["portfolioCapAmount"] is None else str(budget["portfolioCapAmount"]),
+        "remainingUnderCap": None if budget["remainingUnderCap"] is None else str(budget["remainingUnderCap"]),
+        "slotTargetPct": str(budget["slotTargetPct"]),
+        "slotTargetMargin": str(budget["slotTargetMargin"]),
         "marginToUse": str(margin_to_use),
+        "marginSafety": str(MARGIN_SAFETY),
         "marginRate": str(margin_rate),
         "impliedLeverage": inst.get("impliedLeverage"),
         "bid": mkt.get("bid"),
@@ -399,7 +540,7 @@ def dynamic_units_for_instrument(instrument: str, risk_pct: Decimal, side: str, 
         "mid": mkt.get("mid"),
         "spread": mkt.get("spread"),
         "spreadPips": mkt.get("spreadPips"),
-        "maxSpreadPipsEnv": str(MAX_SPREAD_PIPS),
+        "maxSpreadPipsEnvHardCeiling": str(MAX_SPREAD_PIPS),
         "maxSpreadPipsPayload": str(max_spread_pips_override) if max_spread_pips_override is not None else None,
         "maxSpreadPipsEffective": str(effective_max_spread_pips),
         "pipSize": mkt.get("pipSize"),
@@ -436,7 +577,13 @@ def enforce_entry_spread_guard(data: Dict[str, Any], instrument: str) -> Dict[st
     Payload max_spread_pips overrides the Render env value when supplied.
     """
     max_spread_raw = data.get("max_spread_pips", data.get("maxSpreadPips", None))
-    effective_max = MAX_SPREAD_PIPS if max_spread_raw in (None, "") else d(max_spread_raw, "0")
+    payload_max = Decimal("0") if max_spread_raw in (None, "") else d(max_spread_raw, "0")
+    if MAX_SPREAD_PIPS > 0 and payload_max > 0:
+        effective_max = min(MAX_SPREAD_PIPS, payload_max)
+    elif MAX_SPREAD_PIPS > 0:
+        effective_max = MAX_SPREAD_PIPS
+    else:
+        effective_max = payload_max
     acct_status, acct = get_account_snapshot()
     acct_ccy = acct.get("currency", "USD") if acct_status < 300 and acct.get("ok") else "USD"
     mkt_status, mkt = get_market_snapshot(instrument, acct_ccy)
@@ -567,7 +714,7 @@ def close_all(instrument: str, ignore_if_flat: bool = True) -> Dict[str, Any]:
 def root():
     return jsonify({
         "ok": True,
-        "service": "TGIM OANDA Dynamic Margin + Spread Webhook v7.1 — Spread Lock",
+        "service": "TGIM OANDA Dynamic Margin + Spread Webhook v7.2 — Portfolio Slot + Rollover Lock",
         "route": "/webhook",
         "dynamic_margin_sizing": True,
         "force_dynamic_sizing": FORCE_DYNAMIC_SIZING,
@@ -578,12 +725,20 @@ def root():
         "hard_entry_spread_lock": True,
         "spread_buffer_pips": str(SPREAD_BUFFER_PIPS),
         "no_hedge_enforced": True,
+        "portfolio_slot_mode": PORTFOLIO_SLOT_MODE,
+        "max_portfolio_margin_pct": str(MAX_PORTFOLIO_MARGIN_PCT),
+        "max_concurrent_positions": MAX_CONCURRENT_POSITIONS,
+        "default_slot_margin_pct": str(MAX_PORTFOLIO_MARGIN_PCT / Decimal(MAX_CONCURRENT_POSITIONS)),
+        "sizing_equity": "MIN(balance,NAV)",
+        "ny_5pm_entry_blackout": BLOCK_NY_5PM_HOUR,
+        "serialized_entry_processing": True,
+        "payload_risk_pct_is_historical_only_in_slot_mode": not RESPECT_PAYLOAD_RISK_PCT_IN_SLOT_MODE,
     })
 
 
 @app.route("/webhook", methods=["GET", "HEAD"])
 def webhook_get():
-    return jsonify({"ok": True, "route": "/webhook", "expect": "POST JSON", "service": "v7.1", "spread_endpoint": "/spread/<instrument>"})
+    return jsonify({"ok": True, "route": "/webhook", "expect": "POST JSON", "service": "v7.2", "spread_endpoint": "/spread/<instrument>"})
 
 
 @app.route("/spread/<instrument>", methods=["GET"])
@@ -657,35 +812,55 @@ def webhook():
             return tv_response({"ok": body.get("ok", False), "action": action, "instrument": instrument, "result": body})
 
         if action in {"buy", "sell"}:
-            spread_guard = enforce_entry_spread_guard(data, instrument)
-            if not spread_guard.get("ok", False):
-                return tv_response({"ok": False, "action": action, "instrument": instrument, "blocked_new_entry": True, "result": spread_guard})
-            units, sizing = choose_units(data, instrument, action)
-            sizing["entrySpreadGuard"] = spread_guard
-            status, body = strict_synced_entry(action, instrument, units, sizing, policy=policy)
-            return tv_response({"ok": status < 300 and body.get("ok", False), "action": action, "instrument": instrument, "broker_status": status, "result": body})
+            rollover_blocked, ny_now = ny_rollover_blocked_now()
+            if rollover_blocked:
+                return tv_response({
+                    "ok": False, "action": action, "instrument": instrument,
+                    "blocked_new_entry": True, "reason": "ny_5pm_rollover_blackout",
+                    "newYorkTime": ny_now
+                })
+            with ENTRY_LOCK:
+                spread_guard = enforce_entry_spread_guard(data, instrument)
+                if not spread_guard.get("ok", False):
+                    return tv_response({"ok": False, "action": action, "instrument": instrument, "blocked_new_entry": True, "result": spread_guard})
+                units, sizing = choose_units(data, instrument, action)
+                sizing["entrySpreadGuard"] = spread_guard
+                sizing["newYorkTime"] = ny_now
+                status, body = strict_synced_entry(action, instrument, units, sizing, policy=policy)
+                return tv_response({"ok": status < 300 and body.get("ok", False), "action": action, "instrument": instrument, "broker_status": status, "result": body})
 
         if action == "flip":
             target = str(data.get("target") or data.get("side") or "").lower().strip()
-            if target in {"buy", "long"}:
-                entry_payload = {**data, "action": "buy"}
-                spread_guard = enforce_entry_spread_guard(entry_payload, instrument)
-                if not spread_guard.get("ok", False):
-                    return tv_response({"ok": False, "action": action, "instrument": instrument, "target": target, "blocked_new_entry": True, "result": spread_guard})
-                units, sizing = choose_units(entry_payload, instrument, "buy")
-                sizing["entrySpreadGuard"] = spread_guard
-                status, body = strict_synced_entry("buy", instrument, units, sizing, policy="sync")
-            elif target in {"sell", "short"}:
-                entry_payload = {**data, "action": "sell"}
-                spread_guard = enforce_entry_spread_guard(entry_payload, instrument)
-                if not spread_guard.get("ok", False):
-                    return tv_response({"ok": False, "action": action, "instrument": instrument, "target": target, "blocked_new_entry": True, "result": spread_guard})
-                units, sizing = choose_units(entry_payload, instrument, "sell")
-                sizing["entrySpreadGuard"] = spread_guard
-                status, body = strict_synced_entry("sell", instrument, units, sizing, policy="sync")
-            else:
-                return hard_error({"ok": False, "error": "bad_flip_target", "target": target}, 400)
-            return tv_response({"ok": status < 300 and body.get("ok", False), "action": action, "instrument": instrument, "target": target, "broker_status": status, "result": body})
+            rollover_blocked, ny_now = ny_rollover_blocked_now()
+            if rollover_blocked:
+                return tv_response({
+                    "ok": False, "action": action, "instrument": instrument, "target": target,
+                    "blocked_new_entry": True, "reason": "ny_5pm_rollover_blackout",
+                    "newYorkTime": ny_now
+                })
+            with ENTRY_LOCK:
+                if target in {"buy", "long"}:
+                    entry_payload = {**data, "action": "buy"}
+                    spread_guard = enforce_entry_spread_guard(entry_payload, instrument)
+                    if not spread_guard.get("ok", False):
+                        return tv_response({"ok": False, "action": action, "instrument": instrument, "target": target, "blocked_new_entry": True, "result": spread_guard})
+                    units, sizing = choose_units(entry_payload, instrument, "buy")
+                    sizing["entrySpreadGuard"] = spread_guard
+                    sizing["newYorkTime"] = ny_now
+                    status, body = strict_synced_entry("buy", instrument, units, sizing, policy="sync")
+                elif target in {"sell", "short"}:
+                    entry_payload = {**data, "action": "sell"}
+                    spread_guard = enforce_entry_spread_guard(entry_payload, instrument)
+                    if not spread_guard.get("ok", False):
+                        return tv_response({"ok": False, "action": action, "instrument": instrument, "target": target, "blocked_new_entry": True, "result": spread_guard})
+                    units, sizing = choose_units(entry_payload, instrument, "sell")
+                    sizing["entrySpreadGuard"] = spread_guard
+                    sizing["newYorkTime"] = ny_now
+                    status, body = strict_synced_entry("sell", instrument, units, sizing, policy="sync")
+                else:
+                    return hard_error({"ok": False, "error": "bad_flip_target", "target": target}, 400)
+                return tv_response({"ok": status < 300 and body.get("ok", False), "action": action, "instrument": instrument, "target": target, "broker_status": status, "result": body})
+
 
         return hard_error({"ok": False, "error": "unsupported_action", "action": action}, 400)
 
