@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TGIM Joint 4-Rail Sweeper v1.1 — OANDA History Pagination Fix
+TGIM Joint 4-Rail Sweeper v1.2 — TradingView 4-Tick Parity Engine
 ============================
 
 Purpose
@@ -470,6 +470,30 @@ def _push_turn(reg_price, reg_type, reg_bar, reg_count, price, typ, event_bar):
 
 
 @njit(cache=True)
+def _tv_tick_path(o, h, l, c):
+    """
+    TradingView broker-emulator default four-tick path approximation.
+
+    If open is closer to high:
+        O -> H -> L -> C
+    otherwise:
+        O -> L -> H -> C
+
+    This is the important historical-detailization behavior missing in v1/v1.1.
+    """
+    out = np.empty(4, dtype=np.float64)
+    out[0] = o
+    if abs(o - h) <= abs(o - l):
+        out[1] = h
+        out[2] = l
+    else:
+        out[1] = l
+        out[2] = h
+    out[3] = c
+    return out
+
+
+@njit(cache=True)
 def _simulate_one(
     c0, c1, c2, c3,
     e0, p0, d0,
@@ -488,18 +512,26 @@ def _simulate_one(
     reg_bar = np.empty(REGISTRY_LIMIT, dtype=np.int32)
     reg_count = 0
 
+    # Filled strategy position.
     position = 0
     entry_price = 0.0
     target = np.nan
     entry_day = -1
+    entry_tick = -1
     entry_time_ns = 0
     mae_pips = 0.0
 
-    pending_dir = 0
-    pending_target = np.nan
-    pending_signal_day = -1
+    # A strategy.entry market order fills on the NEXT available emulator tick.
+    order_pending = 0
+    order_target = np.nan
+    order_signal_day = -1
+    order_signal_tick = -1
 
+    # Pine guardian direction: flat does not erase last meaningful direction.
     guard_meaningful = 0
+
+    # History-bar target payment prevents another fresh entry on the same Daily bar.
+    exit_day = -1
 
     entries_total = 0
     closed_total = 0
@@ -514,31 +546,19 @@ def _simulate_one(
     wins_fwd = 0
     net_fwd = 0.0
 
+    day_ns = 86_400_000_000_000
+
     for t in range(nd):
-        # Current raw directions.
+        # Structural series are sampled exactly once for this chart bar, matching
+        # the request.security outputs seen by the Daily strategy.
         trigger_dir = int(d0[c0, t])
         g_now = int(d1[c1, t])
         if g_now != 0:
             guard_meaningful = g_now
         guardian_dir = guard_meaningful
 
-        # Orders submitted on previous Daily close fill this Daily open.
-        if pending_dir != 0 and t > pending_signal_day and position == 0:
-            position = pending_dir
-            entry_price = o[t]
-            target = pending_target
-            entry_day = t
-            entry_time_ns = open_ns[t]
-            mae_pips = 0.0
-            if open_ns[t] >= eval_start_ns:
-                entries_total += 1
-            if open_ns[t] >= fwd_start_ns:
-                entries_fwd += 1
-            pending_dir = 0
-            pending_target = np.nan
-            pending_signal_day = -1
-
-        # Store every new raw R turn BEFORE target selection, same source order as Pine.
+        # Store each new R turn once. Pine's f_store_rail_turn de-duplicates the
+        # repeated executions of the same historical Daily bar.
         event_types = np.empty(4, dtype=np.int8)
         event_prices = np.empty(4, dtype=np.float64)
         event_count = 0
@@ -575,78 +595,127 @@ def _simulate_one(
             event_prices[event_count] = pr
             event_count += 1
 
-        # Open-trade MAE + target market close.
-        exited_today = False
-        if position != 0:
-            adverse = (entry_price - l[t]) / pip if position == 1 else (h[t] - entry_price) / pip
-            if adverse > mae_pips:
-                mae_pips = adverse
+        ticks = _tv_tick_path(o[t], h[t], l[t], c[t])
 
-            reached = (c[t] >= target) if position == 1 else (c[t] <= target)
-            if reached:
-                exit_price = c[t]
-                pnl_pips = ((exit_price - entry_price) / pip) if position == 1 else ((entry_price - exit_price) / pip)
-                hold_days = (close_ns[t] - entry_time_ns) / 86_400_000_000_000.0
+        # Approximate the four historical tick timestamps inside the Daily candle.
+        # Exact timestamps do not alter routing; they are used for duration metrics.
+        span = close_ns[t] - open_ns[t]
+        if span <= 0:
+            span = day_ns
 
-                if close_ns[t] >= eval_start_ns:
-                    closed_total += 1
-                    if pnl_pips > 0:
-                        wins_total += 1
-                    net_total += pnl_pips
-                    if mae_pips > max_mae_total:
-                        max_mae_total = mae_pips
-                    if hold_days > longest_total:
-                        longest_total = hold_days
-                    hold_sum_total += hold_days
+        for q in range(4):
+            px = ticks[q]
+            tick_ns = open_ns[t] + (span * q) // 3
 
-                if close_ns[t] >= fwd_start_ns:
-                    closed_fwd += 1
-                    if pnl_pips > 0:
-                        wins_fwd += 1
-                    net_fwd += pnl_pips
+            # ── One-tick-delayed market entry fill ─────────────────────────────
+            if order_pending != 0:
+                later_tick = (t > order_signal_day) or (t == order_signal_day and q > order_signal_tick)
+                if later_tick and position == 0:
+                    position = order_pending
+                    entry_price = px
+                    target = order_target
+                    entry_day = t
+                    entry_tick = q
+                    entry_time_ns = tick_ns
+                    mae_pips = 0.0
 
-                position = 0
-                entry_price = 0.0
-                target = np.nan
-                entry_day = -1
-                entry_time_ns = 0
-                mae_pips = 0.0
-                exited_today = True
+                    if tick_ns >= eval_start_ns:
+                        entries_total += 1
+                    if tick_ns >= fwd_start_ns:
+                        entries_fwd += 1
 
-        # One Leg Only: no same-Daily-bar re-entry after payment.
-        if close_ns[t] < eval_start_ns:
-            continue
-        if position != 0 or pending_dir != 0 or exited_today:
-            continue
+                    order_pending = 0
+                    order_target = np.nan
+                    order_signal_day = -1
+                    order_signal_tick = -1
 
-        # New finalized R rays. Process in R2,R8,R9,R10 storage order.
-        # Candidate direction is ray type: valley=long(+1), peak=short(-1).
-        for ei in range(event_count):
-            et = int(event_types[ei])
-            candidate_dir = 1 if et == 1 else -1
+            # ── Existing-position excursion + immediate TARGET MARKET close ───
+            if position != 0:
+                adverse = ((entry_price - px) / pip) if position == 1 else ((px - entry_price) / pip)
+                if adverse > mae_pips:
+                    mae_pips = adverse
 
-            # RAW qualification:
-            # selected Guardian must agree/intact; selected Trigger must agree.
-            if candidate_dir != guardian_dir or candidate_dir != trigger_dir:
+                reached = (px >= target) if position == 1 else (px <= target)
+                if reached:
+                    # Pine uses strategy.close(... immediately=true): market fill
+                    # occurs on THIS emulator tick, not at the stored ray price.
+                    exit_price = px
+                    pnl_pips = ((exit_price - entry_price) / pip) if position == 1 else ((entry_price - exit_price) / pip)
+                    hold_days = max(0.0, (tick_ns - entry_time_ns) / float(day_ns))
+
+                    if tick_ns >= eval_start_ns:
+                        closed_total += 1
+                        if pnl_pips > 0:
+                            wins_total += 1
+                        net_total += pnl_pips
+                        if mae_pips > max_mae_total:
+                            max_mae_total = mae_pips
+                        if hold_days > longest_total:
+                            longest_total = hold_days
+                        hold_sum_total += hold_days
+
+                    if tick_ns >= fwd_start_ns:
+                        closed_fwd += 1
+                        if pnl_pips > 0:
+                            wins_fwd += 1
+                        net_fwd += pnl_pips
+
+                    position = 0
+                    entry_price = 0.0
+                    target = np.nan
+                    entry_day = -1
+                    entry_tick = -1
+                    entry_time_ns = 0
+                    mae_pips = 0.0
+                    exit_day = t
+
+                    # No calc_on_order_fills recalc. Continue to next synthetic tick.
+                    continue
+
+            # ── Fresh pivot-ray entry qualification ────────────────────────────
+            if tick_ns < eval_start_ns:
+                continue
+            if position != 0 or order_pending != 0:
+                continue
+            if exit_day == t:
+                # Mirrors lastPivotTradeExitBar / _liveExitCooldownClear on history:
+                # a paid target cannot create another fresh entry on this same Daily bar.
+                continue
+            if event_count == 0:
                 continue
 
-            tgt = _find_target(
-                reg_price, reg_type, reg_bar, reg_count,
-                -et, t - 1
-            )
-            if not np.isfinite(tgt):
-                continue
+            # On historical four-tick execution the finalized event is visible on
+            # every execution of this chart bar. The first qualifying tick submits.
+            for ei in range(event_count):
+                et = int(event_types[ei])
+                candidate_dir = 1 if et == 1 else -1
 
-            target_valid = (tgt > c[t]) if candidate_dir == 1 else (tgt < c[t])
-            if not target_valid:
-                continue
+                # RAW qualification:
+                # Guardian meaningful direction + committed direction agree,
+                # and selected Trigger rail is aligned.
+                if candidate_dir != guardian_dir or candidate_dir != trigger_dir:
+                    continue
 
-            pending_dir = candidate_dir
-            pending_target = tgt
-            pending_signal_day = t
-            break
+                tgt = _find_target(
+                    reg_price, reg_type, reg_bar, reg_count,
+                    -et, t - 1
+                )
+                if not np.isfinite(tgt):
+                    continue
 
-    open_end = 1 if (position != 0 or pending_dir != 0) else 0
+                # Target validity uses current execution price (realClose on the
+                # synthetic historical tick), not always the Daily final close.
+                target_valid = (tgt > px) if candidate_dir == 1 else (tgt < px)
+                if not target_valid:
+                    continue
+
+                order_pending = candidate_dir
+                order_target = tgt
+                order_signal_day = t
+                order_signal_tick = q
+                break
+
+    open_end = 1 if (position != 0 or order_pending != 0) else 0
     avg_hold = hold_sum_total / closed_total if closed_total > 0 else 9999.0
 
     out = np.empty(13, dtype=np.float64)
@@ -936,7 +1005,9 @@ def main() -> int:
     print(f"      30d  closed/wins: {base_metrics['closed_30d']}/{base_metrics['wins_30d']}")
     print(f"      MAE: {base_metrics['max_mae_pips_120d']:.2f} pips"
           f" | longest: {base_metrics['longest_days_120d']:.2f}d"
-          f" | net: {base_metrics['net_pips_120d']:.1f} pips")
+          f" | avg hold: {base_metrics['avg_hold_days_120d']:.2f}d"
+          f" | net: {base_metrics['net_pips_120d']:.1f} pips"
+          f" | end open/pending: {base_metrics['open_or_pending_end']}")
 
     certified = (
         expected is None or
@@ -950,6 +1021,7 @@ def main() -> int:
                     for s in SLOT_ORDER},
         "metrics":base_metrics,
         "certified":bool(certified),
+        "execution_model":"TradingView Default Detailization: 4 ticks/bar + one-tick entry delay + immediate target market close",
         "note":"TradingView remains final verifier. Exact OANDA-vs-TradingView candle alignment can expose a residual mismatch."
     }
     (result_dir/"BASE_CERTIFICATION.json").write_text(json.dumps(cert,indent=2))
