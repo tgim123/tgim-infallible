@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-TGIM REDLINE 5-R SWEEPER v2.2 — PARITY ENGINE
+TGIM REDLINE 5-R SWEEPER v2.3 — PARITY MATRIX ENGINE
 =============================================
 
-BUILD ID: REDLINE-5R-V2.2-20260826-B
+BUILD ID: REDLINE-5R-V2.3-20260826-C
 
 Five fixed timeframe bays:
     R1  = 1W
@@ -71,7 +71,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-BUILD_ID = "REDLINE-5R-V2.2-20260826-B"
+BUILD_ID = "REDLINE-5R-V2.3-20260826-C"
 
 try:
     from numba import njit, prange
@@ -531,6 +531,45 @@ def candidate_daily_tick_arrays(daily, cfgs):
     return evt, price, direction
 
 
+
+def candidate_daily_static_tick_arrays(daily, cfgs):
+    """
+    Confirmed/final Daily rail state repeated across the four historical executions.
+
+    This is intentionally tested beside tick-dynamic Daily semantics because
+    request.security(same-TF, lookahead_off) + TradingView's history-tick model
+    must be established empirically against the production 36/36 control.
+    """
+    close = daily["close"].to_numpy(np.float64)
+    nc, nd = len(cfgs), len(daily)
+    evt = np.zeros((nc, nd, 4), dtype=np.int8)
+    price = np.full((nc, nd, 4), np.nan, dtype=np.float64)
+    direction = np.zeros((nc, nd, 4), dtype=np.int8)
+
+    for ci, cfg in enumerate(cfgs):
+        r = rail_np(close, cfg.family, cfg.length)
+        for t in range(1, nd):
+            cur = r[t]
+            inv = r[t - 1]
+            if not (np.isfinite(cur) and np.isfinite(inv)):
+                continue
+            d = 1 if cur > inv else (-1 if cur < inv else 0)
+            typ = 0
+            if t >= 2 and np.isfinite(r[t - 2]):
+                if cur > inv and inv <= r[t - 2]:
+                    typ = 1
+                elif cur < inv and inv >= r[t - 2]:
+                    typ = -1
+            for q in range(4):
+                direction[ci, t, q] = d
+                price[ci, t, q] = inv
+                evt[ci, t, q] = typ
+
+    commit = np.zeros((nd, 4), dtype=np.bool_)
+    commit[:, 3] = True
+    return evt, price, direction, commit
+
+
 def candidate_static_tick_arrays(source, daily, granularity, cfgs):
     """Expand historical request.security snapshots to the four Daily executions."""
     close = source["close"].to_numpy(dtype=np.float64)
@@ -589,9 +628,14 @@ def candidate_tick_arrays(source, daily, granularity, cfgs):
 
 
 @njit(cache=True)
-def _find_target(reg_price, reg_type, reg_bar, reg_source, reg_count, wanted_type, current_event_bar, wanted_source):
+def _find_target(reg_price, reg_type, reg_bar, reg_source, reg_count,
+                 wanted_type, current_event_bar, wanted_source, same_rail_only):
+    # Pine f_previous_pivot_target():
+    #   Any Route R -> immediately previous opposite standalone route ray
+    #   Same R      -> same search, additionally restricted to event source.
     for k in range(reg_count - 1, -1, -1):
-        if reg_source[k] == wanted_source and reg_bar[k] < current_event_bar and reg_type[k] == wanted_type:
+        source_ok = (not same_rail_only) or (reg_source[k] == wanted_source)
+        if source_ok and reg_bar[k] < current_event_bar and reg_type[k] == wanted_type:
             return reg_price[k]
     return np.nan
 
@@ -633,7 +677,7 @@ def _selected_dir(role_idx,c0,c1,c2,c3,c4,d0,d1,d2,d3,d4,t,q):
 @njit(cache=True)
 def _simulate_one(c0,c1,c2,c3,c4,guardian_role,trigger_role,
                   e0,p0,d0,e1,p1,d1,e2,p2,d2,e3,p3,d3,e4,p4,d4,commit_mask,
-                  o,h,l,c,open_ns,close_ns,eval_start_ns,fwd_start_ns,pip,registry_limit):
+                  o,h,l,c,open_ns,close_ns,eval_start_ns,fwd_start_ns,pip,registry_limit,same_rail_only):
     nd = len(c)
     reg_price=np.empty(MAX_REGISTRY_LIMIT); reg_type=np.empty(MAX_REGISTRY_LIMIT,dtype=np.int8)
     reg_bar=np.empty(MAX_REGISTRY_LIMIT,dtype=np.int32); reg_source=np.empty(MAX_REGISTRY_LIMIT,dtype=np.int8); reg_count=0
@@ -692,7 +736,7 @@ def _simulate_one(c0,c1,c2,c3,c4,guardian_role,trigger_role,
             for ei in range(event_count):
                 et=int(event_types[ei]); src=int(event_sources[ei]); cand=1 if et==1 else -1
                 if cand!=guard_last or cand!=guard_committed or cand!=trigger_dir: continue
-                tgt=_find_target(reg_price,reg_type,reg_bar,reg_source,reg_count,-et,t-1,src)
+                tgt=_find_target(reg_price,reg_type,reg_bar,reg_source,reg_count,-et,t-1,src,same_rail_only)
                 if not np.isfinite(tgt): continue
                 if not ((tgt>px) if cand==1 else (tgt<px)): continue
                 order_pending=cand; order_target=tgt; order_signal_day=t; order_signal_tick=q; break
@@ -705,12 +749,12 @@ def _simulate_one(c0,c1,c2,c3,c4,guardian_role,trigger_role,
 
 @njit(parallel=True, cache=True)
 def simulate_many(combos,e0,p0,d0,e1,p1,d1,e2,p2,d2,e3,p3,d3,e4,p4,d4,commit_mask,
-                  o,h,l,c,open_ns,close_ns,eval_start_ns,fwd_start_ns,pip,registry_limit):
+                  o,h,l,c,open_ns,close_ns,eval_start_ns,fwd_start_ns,pip,registry_limit,same_rail_only):
     n=combos.shape[0]; out=np.empty((n,13))
     for i in prange(n):
         out[i]=_simulate_one(combos[i,0],combos[i,1],combos[i,2],combos[i,3],combos[i,4],combos[i,5],combos[i,6],
                              e0,p0,d0,e1,p1,d1,e2,p2,d2,e3,p3,d3,e4,p4,d4,commit_mask,
-                             o,h,l,c,open_ns,close_ns,eval_start_ns,fwd_start_ns,pip,registry_limit)
+                             o,h,l,c,open_ns,close_ns,eval_start_ns,fwd_start_ns,pip,registry_limit,same_rail_only)
     return out
 
 
@@ -809,11 +853,14 @@ def build_top_rows(
     return pd.DataFrame(rows)
 
 
-def prepare_banks(raw, daily, cfgs):
+def prepare_banks(raw, daily, cfgs, daily_mode="dynamic"):
     out=[]; commits=[]
     for slot in SLOT_ORDER:
         gran=SLOT_TF[slot]
-        evt,price,direction,commit=candidate_tick_arrays(raw[gran],daily,gran,cfgs[slot])
+        if gran == "D" and daily_mode == "static":
+            evt,price,direction,commit = candidate_daily_static_tick_arrays(daily, cfgs[slot])
+        else:
+            evt,price,direction,commit = candidate_tick_arrays(raw[gran],daily,gran,cfgs[slot])
         out.append((evt,price,direction)); commits.append(commit)
     return out, np.stack(commits,axis=0)
 
@@ -937,7 +984,7 @@ def merge_leaders(best_c, best_m, new_c, new_m, keep_n):
 
 def stream_search(
     batches, banks, commit_mask, o,h,l,c,ons,cns, eval_start_ns,fwd_start_ns,pip,registry_limit,
-    keep_n, deadline=None, progress_label="joint",
+    keep_n, same_rail_only, deadline=None, progress_label="joint",
 ):
     best_c = None
     best_m = None
@@ -953,7 +1000,7 @@ def stream_search(
             combo_batch,
             *banks[0], *banks[1], *banks[2], *banks[3], *banks[4],
             commit_mask,
-            o,h,l,c,ons,cns,eval_start_ns,fwd_start_ns,pip,registry_limit
+            o,h,l,c,ons,cns,eval_start_ns,fwd_start_ns,pip,registry_limit,same_rail_only
         )
         best_c, best_m = merge_leaders(best_c,best_m,combo_batch,m,keep_n)
         processed += len(combo_batch)
@@ -1032,7 +1079,7 @@ def refine_combo_batches(seed_df, cfgs, radius, max_len, batch_size):
 
 
 
-def baseline_trade_ledger(combo,banks,commit_mask,daily,eval_start_ns,fwd_start_ns,pip,registry_limit):
+def baseline_trade_ledger(combo,banks,commit_mask,daily,eval_start_ns,fwd_start_ns,pip,registry_limit,same_rail_only):
     cfg_idx=[int(combo[i]) for i in range(5)]; guardian_role=int(combo[5]); trigger_role=int(combo[6])
     o=daily["open"].to_numpy(np.float64); h=daily["high"].to_numpy(np.float64); l=daily["low"].to_numpy(np.float64); c=daily["close"].to_numpy(np.float64)
     ons=daily["bar_open_ns"].to_numpy(np.int64); cns=daily["bar_close_ns"].to_numpy(np.int64)
@@ -1051,7 +1098,9 @@ def baseline_trade_ledger(combo,banks,commit_mask,daily,eval_start_ns,fwd_start_
             reg[found]["price"]=float(price_); reg[found]["type"]=int(typ_)
     def find_target(typ_,bar_,source_):
         for x in reversed(reg):
-            if x["source"]==source_ and x["bar"]<bar_ and x["type"]==typ_: return x["price"]
+            source_ok = (not same_rail_only) or x["source"] == source_
+            if source_ok and x["bar"] < bar_ and x["type"] == typ_:
+                return x["price"]
         return np.nan
     for t in range(len(daily)):
         path=[o[t], h[t] if abs(o[t]-h[t])<=abs(o[t]-l[t]) else l[t], l[t] if abs(o[t]-h[t])<=abs(o[t]-l[t]) else h[t], c[t]]
@@ -1087,7 +1136,7 @@ def baseline_trade_ledger(combo,banks,commit_mask,daily,eval_start_ns,fwd_start_
 def main() -> int:
     print("=" * 72, flush=True)
     print(f"TGIM SWEEPER BUILD: {BUILD_ID}", flush=True)
-    print("ARCHITECTURE: FIVE-R REDLINE PARITY v2.2 | SOURCE-KEYED SAME-R TARGETS | TICK-DYNAMIC 1D", flush=True)
+    print("ARCHITECTURE: FIVE-R REDLINE PARITY v2.3 | ANY-ROUTE CONTROL | 4-MODE PARITY MATRIX", flush=True)
     print("=" * 72, flush=True)
     ap = argparse.ArgumentParser(
         description="TGIM Redline five-R joint rail-family/length + Guardian/Trigger optimizer."
@@ -1102,6 +1151,8 @@ def main() -> int:
 
     ap.add_argument("--lengths", default="3,5,8,13,21,27,34")
     ap.add_argument("--registry-limit", type=int, default=27, choices=[20,27])
+    ap.add_argument("--target-scope", choices=["any","same"], default="any",
+                    help="Production control is Any Route R; Same R is diagnostic.")
 
     ap.add_argument("--expected-total", type=int, default=None)
     ap.add_argument("--expected-forward", type=int, default=None)
@@ -1165,7 +1216,10 @@ def main() -> int:
 
     print(f"[2/10] Building {len(lengths)*len(FAMILIES)} rail candidates per R bay ...")
     cfgs = coarse_cfgs(lengths)
-    banks, commit_mask = prepare_banks(raw,daily,cfgs)
+
+    # Build BOTH plausible Daily-history semantics. Everything else is identical.
+    banks_dynamic, commit_dynamic = prepare_banks(raw,daily,cfgs,daily_mode="dynamic")
+    banks_static,  commit_static  = prepare_banks(raw,daily,cfgs,daily_mode="static")
 
     o = daily["open"].to_numpy(np.float64)
     h = daily["high"].to_numpy(np.float64)
@@ -1175,18 +1229,6 @@ def main() -> int:
     cns = daily["bar_close_ns"].to_numpy(np.int64)
     pip = pip_size(instrument)
 
-    print("[3/10] BASE certification ...")
-    bc = baseline_combo(cfgs)
-    bm = simulate_many(
-        bc,
-        *banks[0],*banks[1],*banks[2],*banks[3],*banks[4],
-        commit_mask,
-        o,h,l,c,ons,cns,eval_start_ns,fwd_start_ns,pip,args.registry_limit
-    )[0]
-    base_metrics = metric_dict(bm)
-    base_ledger = baseline_trade_ledger(bc[0],banks,commit_mask,daily,eval_start_ns,fwd_start_ns,pip,args.registry_limit)
-    base_ledger.to_csv(result_dir/"BASELINE_TRADE_LEDGER.csv",index=False)
-
     expected_total = args.expected_total
     if expected_total is None:
         expected_total = EXPECTED_TOTAL.get(instrument)
@@ -1195,55 +1237,131 @@ def main() -> int:
     if expected_forward is None:
         expected_forward = EXPECTED_FORWARD.get(instrument)
 
-    print("       BASE:", " | ".join(
-        f"{s} {BASELINE[s][0]}{BASELINE[s][1]} RAW" for s in SLOT_ORDER
-    ))
-    print(f"       Guardian={BASE_GUARDIAN} | Trigger={BASE_TRIGGER} | "
-          f"same-R={BASE_GUARDIAN==BASE_TRIGGER} | registry={args.registry_limit}")
-    print(f"       120d closed/wins: {base_metrics['closed_120d']}/{base_metrics['wins_120d']}")
-    print(f"       30d  closed/wins: {base_metrics['closed_30d']}/{base_metrics['wins_30d']}")
-    print(f"       MAE: {base_metrics['max_mae_pips_120d']:.2f} pips"
-          f" | longest: {base_metrics['longest_days_120d']:.2f}d"
-          f" | avg: {base_metrics['avg_hold_days_120d']:.2f}d"
-          f" | net: {base_metrics['net_pips_120d']:.1f} pips")
-    print(f"       Parity ledger: {len(base_ledger)} closed trades -> {result_dir/'BASELINE_TRADE_LEDGER.csv'}")
-    if len(base_ledger):
-        for _,r in base_ledger.tail(5).iterrows():
-            print(f"         {r['exit_time_utc']} | {r['source_R']} {r['side']} | {r['pips']:.1f}p | MAE {r['mae_pips']:.1f} | {r['hold_days']:.2f}d")
+    bc = baseline_combo(cfgs)
 
-    certified = True
-    if expected_total is not None:
-        certified = certified and (
-            base_metrics["closed_120d"] == expected_total and
-            base_metrics["wins_120d"] == expected_total
-        )
-    if expected_forward is not None:
-        certified = certified and (
-            base_metrics["closed_30d"] == expected_forward and
-            base_metrics["wins_30d"] == expected_forward
-        )
+    print("[3/10] BASE parity matrix ...")
+    matrix_specs = [
+        ("DYNAMIC_D + ANY_ROUTE", banks_dynamic, commit_dynamic, False),
+        ("STATIC_D  + ANY_ROUTE", banks_static,  commit_static,  False),
+        ("DYNAMIC_D + SAME_R",    banks_dynamic, commit_dynamic, True),
+        ("STATIC_D  + SAME_R",    banks_static,  commit_static,  True),
+    ]
+
+    matrix_rows = []
+    exact_any = []
+    for label, mbanks, mcommit, same_only in matrix_specs:
+        mm = simulate_many(
+            bc,
+            *mbanks[0],*mbanks[1],*mbanks[2],*mbanks[3],*mbanks[4],mcommit,
+            o,h,l,c,ons,cns,eval_start_ns,fwd_start_ns,pip,args.registry_limit,same_only
+        )[0]
+        md = metric_dict(mm)
+        exact = True
+        if expected_total is not None:
+            exact = exact and md["closed_120d"] == expected_total and md["wins_120d"] == expected_total
+        if expected_forward is not None:
+            exact = exact and md["closed_30d"] == expected_forward and md["wins_30d"] == expected_forward
+
+        print(f"       {label:<23} | 120d {md['closed_120d']}/{md['wins_120d']}"
+              f" | 30d {md['closed_30d']}/{md['wins_30d']}"
+              f" | MAE {md['max_mae_pips_120d']:.2f}"
+              f" | longest {md['longest_days_120d']:.2f}d"
+              f" | {'EXACT' if exact else 'MISS'}")
+
+        matrix_rows.append({
+            "mode":label,
+            "daily_mode":"dynamic" if label.startswith("DYNAMIC") else "static",
+            "target_scope":"same" if same_only else "any",
+            "exact":bool(exact),
+            **md,
+        })
+        if exact and not same_only:
+            exact_any.append((label,mbanks,mcommit,same_only,md))
+
+    matrix_df = pd.DataFrame(matrix_rows)
+    matrix_df.to_csv(result_dir/"BASE_PARITY_MATRIX.csv",index=False)
+
+    # Production settings show Any Route R. Only an Any-Route exact parity mode
+    # is allowed to unlock millions of optimization systems.
+    if exact_any:
+        label,banks,commit_mask,same_rail_only,base_metrics = exact_any[0]
+        certified = True
+        selected_daily_mode = "dynamic" if label.startswith("DYNAMIC") else "static"
+        selected_scope = "any"
+        print(f"       SELECTED PARITY MODEL: {label}")
+    else:
+        # Use requested production mode only to generate a forensic ledger.
+        selected_daily_mode = "dynamic"
+        same_rail_only = (args.target_scope == "same")
+        banks = banks_dynamic
+        commit_mask = commit_dynamic
+        selected_scope = args.target_scope
+        preferred_label = "DYNAMIC_D + " + ("SAME_R" if same_rail_only else "ANY_ROUTE")
+        pref = matrix_df.loc[matrix_df["mode"] == preferred_label]
+        if len(pref):
+            p = pref.iloc[0]
+            base_metrics = {
+                k: p[k] for k in (
+                    "entries_120d","closed_120d","wins_120d","win_pct_120d",
+                    "net_pips_120d","max_mae_pips_120d","longest_days_120d",
+                    "avg_hold_days_120d","entries_30d","closed_30d","wins_30d",
+                    "win_pct_30d","net_pips_30d","open_or_pending_end","completion_pct_120d"
+                )
+            }
+        else:
+            base_metrics = metric_dict(simulate_many(
+                bc,*banks[0],*banks[1],*banks[2],*banks[3],*banks[4],commit_mask,
+                o,h,l,c,ons,cns,eval_start_ns,fwd_start_ns,pip,args.registry_limit,same_rail_only
+            )[0])
+        certified = False
+
+    print("       BASE:", " | ".join(
+        f"{slot} {BASELINE[slot][0]}{BASELINE[slot][1]} RAW" for slot in SLOT_ORDER
+    ))
+    print(f"       Guardian={BASE_GUARDIAN} | Trigger={BASE_TRIGGER}"
+          f" | target-scope={selected_scope.upper()}"
+          f" | daily={selected_daily_mode.upper()}"
+          f" | registry={args.registry_limit}")
+
+    base_ledger = baseline_trade_ledger(
+        bc[0],banks,commit_mask,daily,eval_start_ns,fwd_start_ns,pip,args.registry_limit,same_rail_only
+    )
+    base_ledger.to_csv(result_dir/"BASELINE_TRADE_LEDGER.csv",index=False)
 
     cert = {
-        "instrument": instrument,
-        "baseline": {
-            **{s: {"tf":SLOT_TF[s],"family":BASELINE[s][0],"length":BASELINE[s][1],"working":"RAW"}
-               for s in SLOT_ORDER},
-            "guardian": BASE_GUARDIAN,
-            "trigger": BASE_TRIGGER,
-            "registry_limit": args.registry_limit,
+        "instrument":instrument,
+        "build_id":BUILD_ID,
+        "expected_total":expected_total,
+        "expected_forward":expected_forward,
+        "production_target_scope":"Any Route R",
+        "selected_daily_mode":selected_daily_mode,
+        "selected_target_scope":selected_scope,
+        "baseline":{
+            **{slot:{"tf":SLOT_TF[slot],"family":BASELINE[slot][0],"length":BASELINE[slot][1],"working":"RAW"}
+               for slot in SLOT_ORDER},
+            "guardian":BASE_GUARDIAN,
+            "trigger":BASE_TRIGGER,
+            "registry_limit":args.registry_limit,
         },
-        "expected_total": expected_total,
-        "expected_forward": expected_forward,
-        "metrics": base_metrics,
-        "certified": bool(certified),
-        "execution_model": "Parity v2.2: source-keyed same-R registry + tick-dynamic Daily + source-close Guardian commit",
+        "metrics":base_metrics,
+        "certified":bool(certified),
+        "parity_matrix":matrix_rows,
     }
     (result_dir/"BASE_CERTIFICATION.json").write_text(json.dumps(cert,indent=2))
 
+    print(f"       Parity ledger: {len(base_ledger)} closed trades -> {result_dir/'BASELINE_TRADE_LEDGER.csv'}")
+    if len(base_ledger):
+        for _,r in base_ledger.tail(5).iterrows():
+            print(f"         {r['entry_time_utc']} | {r['source_R']} {r['side']}"
+                  f" | {r['pips']:.1f}p | MAE {r['mae_pips']:.1f} | {r['hold_days']:.2f}d")
+    print()
+
     if not certified and not args.force_sweep:
         print("\nBASE MISMATCH — REDLINE SWEEP ABORTED.")
-        print("The optimizer will not search millions of systems until the production control reproduces.")
-        print(f"Certification file: {result_dir/'BASE_CERTIFICATION.json'}")
+        print("None of the Any-Route parity modes reproduced the production control.")
+        print("The 4-mode matrix above isolates target-scope vs Daily-history semantics before another code change.")
+        print(f"Parity matrix:      {result_dir/'BASE_PARITY_MATRIX.csv'}")
+        print(f"Certification file:{result_dir/'BASE_CERTIFICATION.json'}")
         print(f"Trade ledger:       {result_dir/'BASELINE_TRADE_LEDGER.csv'}")
         print("Do NOT force-sweep a mismatched model.")
         return 2
@@ -1254,7 +1372,7 @@ def main() -> int:
         pc,
         *banks[0],*banks[1],*banks[2],*banks[3],*banks[4],
         commit_mask,
-        o,h,l,c,ons,cns,eval_start_ns,fwd_start_ns,pip,args.registry_limit
+        o,h,l,c,ons,cns,eval_start_ns,fwd_start_ns,pip,args.registry_limit,same_rail_only
     )
 
     # Persist a compact prescreen summary.
@@ -1283,7 +1401,7 @@ def main() -> int:
         bench,
         *banks[0],*banks[1],*banks[2],*banks[3],*banks[4],
         commit_mask,
-        o,h,l,c,ons,cns,eval_start_ns,fwd_start_ns,pip,args.registry_limit
+        o,h,l,c,ons,cns,eval_start_ns,fwd_start_ns,pip,args.registry_limit,same_rail_only
     )
     bench_elapsed = max(0.001,time.time()-t0)
     rate = len(bench)/bench_elapsed
@@ -1319,7 +1437,7 @@ def main() -> int:
     joint_batches = iter_joint_batches(shortlists,args.batch_size)
     jc,jm,processed,complete = stream_search(
         joint_batches,banks,commit_mask,o,h,l,c,ons,cns,eval_start_ns,fwd_start_ns,pip,args.registry_limit,
-        keep_n=args.top,deadline=hard_deadline,progress_label="REDLINE"
+        keep_n=args.top,same_rail_only=same_rail_only,deadline=hard_deadline,progress_label="REDLINE"
     )
     if jc is None:
         raise SystemExit("Joint search produced no results.")
@@ -1342,13 +1460,13 @@ def main() -> int:
         print(f"[9/10] Exact-length local refinement around top {args.refine_top} systems ...")
         seeds = top.head(args.refine_top)
         rcfg = refine_cfgs(seeds,args.refine_radius,args.max_refine_length)
-        rbanks, rcommit_mask = prepare_banks(raw,daily,rcfg)
+        rbanks, rcommit_mask = prepare_banks(raw,daily,rcfg,daily_mode=selected_daily_mode)
         rbatches = refine_combo_batches(
             seeds,rcfg,args.refine_radius,args.max_refine_length,args.batch_size
         )
         rc,rm,rprocessed,rcomplete = stream_search(
             rbatches,rbanks,rcommit_mask,o,h,l,c,ons,cns,eval_start_ns,fwd_start_ns,pip,args.registry_limit,
-            keep_n=args.top,deadline=hard_deadline,progress_label="REFINE"
+            keep_n=args.top,same_rail_only=same_rail_only,deadline=hard_deadline,progress_label="REFINE"
         )
         if rc is not None:
             refined = build_top_rows(rc,rm,rcfg,args.top)
