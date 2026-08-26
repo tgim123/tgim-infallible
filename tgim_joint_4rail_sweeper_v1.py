@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TGIM Joint 4-Rail Sweeper v1
+TGIM Joint 4-Rail Sweeper v1.1 — OANDA History Pagination Fix
 ============================
 
 Purpose
@@ -151,7 +151,11 @@ class OandaHistory:
                 if r.status_code == 429:
                     time.sleep(min(8.0, 0.75 * (2 ** attempt)))
                     continue
-                r.raise_for_status()
+                if r.status_code >= 400:
+                    body = (r.text or "")[:800]
+                    raise RuntimeError(
+                        f"OANDA HTTP {r.status_code}: {body} | url={r.url}"
+                    )
                 return r.json()
             except Exception as exc:
                 last_err = exc
@@ -228,7 +232,14 @@ class OandaHistory:
             if nxt <= cursor:
                 break
             cursor = nxt
-            if len(candles) < 5000 and last_time.to_pydatetime() >= end - timedelta(seconds=step_sec):
+
+            # v1.1: A page shorter than the requested 5000 candles is the final
+            # available page. Stop immediately instead of advancing the cursor
+            # beyond OANDA's newest candle and issuing a future-dated request.
+            if len(candles) < 5000:
+                break
+
+            if last_time.to_pydatetime() >= end - timedelta(seconds=step_sec):
                 break
 
         if not rows:
@@ -871,7 +882,10 @@ def main() -> int:
     result_dir=Path(args.output_dir) / instrument / datetime.now().strftime("%Y%m%d_%H%M%S")
     result_dir.mkdir(parents=True,exist_ok=True)
 
-    end=datetime.now(timezone.utc)+timedelta(days=2)
+    # v1.1: Historical requests must never deliberately point into the future.
+    # The previous +2 day cushion could advance Daily pagination to a future
+    # 17:00 New York candle boundary and OANDA correctly returned HTTP 400.
+    end=datetime.now(timezone.utc)
     start=end-timedelta(days=args.history_days+5)
 
     print(f"[1/7] Fetching/caching OANDA {instrument} D/M15/M5/M1 ...")
