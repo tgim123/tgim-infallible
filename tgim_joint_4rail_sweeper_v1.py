@@ -1,55 +1,49 @@
 #!/usr/bin/env python3
 """
-TGIM Joint 4-Rail Sweeper v1.2 — TradingView 4-Tick Parity Engine
-============================
+TGIM REDLINE 5-R SWEEPER v2.1 — DEPLOY BUILD
+=============================================
 
-Purpose
--------
-Search the FIVE-R ORGANISM jointly.
+BUILD ID: REDLINE-5R-V2.1-20260826-A
 
-Fixed timeframe bays:
+Five fixed timeframe bays:
+    R1  = 1W
     R2  = 1D
     R8  = 15m
     R9  = 5m
     R10 = 1m
 
-RAW only. ADX/DI gates OFF during this search.
+Baseline:
+    R1  = HMA5 RAW
+    R2  = EMA5 RAW  Guardian + Trigger
+    R8  = HMA27 RAW
+    R9  = KS27 RAW
+    R10 = KS27 RAW
 
-Each bay varies:
-    Rail family: EMA / HMA / KS / WMA
-    Length:      5 / 8 / 13 / 21 / 27 / 34
+Search:
+    EMA / HMA / KS / WMA
+    lengths 3 / 5 / 8 / 13 / 21 / 27 / 34
+    Guardian = any of the five R bays
+    Trigger  = any of the five R bays
+    Guardian and Trigger may be the SAME R.
 
-Coarse Cartesian search:
-    24 x 24 x 24 x 24 = 331,776 complete four-rail systems.
+Adaptive REDLINE behavior:
+    baseline certification
+    candidate prescreen
+    diversity-preserving shortlist
+    actual Render throughput benchmark
+    largest safe K^5 x 25 joint search inside runtime budget
+    streaming result retention
+    exact-length local refinement
 
-Current production control:
-    R2  = EMA 5 RAW
-    R8  = HMA 27 RAW
-    R9  = KS 27 RAW
-    R10 = KS 27 RAW
+EURUSD current control:
+    36/36 total
+    11/11 latest 30d
 
-The search is BASELINE-GATED. By default the script refuses to rank candidates
-when its production-control result does not match the expected TradingView total
-trade count for the selected 50SET pair.
+RAW fixed. ADX off for this phase.
+Registry defaults to 27 and may be switched to 20 for a control run.
 
-Historical engine ported for this RAW / One-Leg-Only research phase:
-- OANDA candle data
-- TradingView/OANDA Daily chart as the execution clock
-- source-timeframe HMA/WMA/KS(ta.linreg)/EMA rail math
-- raw rail/inverse turn detection
-- global 27-turn R registry
-- clutter averaging OFF
-- Any Route R previous-opposite target
-- R2 Trigger direction + R8 Guardian direction
-- one open trade at a time
-- new-ray entries only
-- entry fills next Daily bar open
-- target exits when Daily realClose reaches/crosses the stored target
-- no Guardian exit while a trade is open
-- one-leg-only cooldown after target payment
-- normalized pips / MAE / duration metrics
-
-This is a research accelerator. TradingView remains the final verifier.
+This Python program is research-only and cannot place orders.
+TradingView remains the final verifier.
 """
 
 from __future__ import annotations
@@ -69,6 +63,8 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 import requests
+
+BUILD_ID = "REDLINE-5R-V2.1-20260826-A"
 
 try:
     from numba import njit, prange
@@ -1057,6 +1053,10 @@ def refine_combo_batches(seed_df, cfgs, radius, max_len, batch_size):
 
 
 def main() -> int:
+    print("=" * 72, flush=True)
+    print(f"TGIM SWEEPER BUILD: {BUILD_ID}", flush=True)
+    print("ARCHITECTURE: FIVE-R REDLINE | R1/R2/R8/R9/R10 | SAME-R G+T ALLOWED", flush=True)
+    print("=" * 72, flush=True)
     ap = argparse.ArgumentParser(
         description="TGIM Redline five-R joint rail-family/length + Guardian/Trigger optimizer."
     )
