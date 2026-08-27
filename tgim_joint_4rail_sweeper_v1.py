@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-TGIM REDLINE 5-R SWEEPER v2.3 — PARITY MATRIX ENGINE
+TGIM REDLINE 5-R SWEEPER v2.4 — EXACT CONTROL PARITY
 =============================================
 
-BUILD ID: REDLINE-5R-V2.3-20260826-C
+BUILD ID: REDLINE-5R-V2.4-20260826-D
 
 Five fixed timeframe bays:
     R1  = 1W
@@ -71,7 +71,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-BUILD_ID = "REDLINE-5R-V2.3-20260826-C"
+BUILD_ID = "REDLINE-5R-V2.4-20260826-D"
 
 try:
     from numba import njit, prange
@@ -566,7 +566,7 @@ def candidate_daily_static_tick_arrays(daily, cfgs):
                 evt[ci, t, q] = typ
 
     commit = np.zeros((nd, 4), dtype=np.bool_)
-    commit[:, 3] = True
+    commit[:, 0] = True
     return evt, price, direction, commit
 
 
@@ -608,17 +608,28 @@ def candidate_tick_arrays(source, daily, granularity, cfgs):
     nd = len(daily)
     if granularity == "D":
         evt, price, direction = candidate_daily_tick_arrays(daily, cfgs)
-        commit = np.zeros((nd, 4), dtype=np.bool_); commit[:, 3] = True
+        commit = np.zeros((nd, 4), dtype=np.bool_)
+        # Pine history bars report barstate.isconfirmed on every History Bar Tick.
+        # Guardian source-period commit therefore happens on the first eligible
+        # execution of the chart bar, before trade qualification.
+        commit[:, 0] = True
         return evt, price, direction, commit
 
     evt, price, direction, source_idx = candidate_static_tick_arrays(source, daily, granularity, cfgs)
     commit = np.zeros((nd, 4), dtype=np.bool_)
     if granularity == "W":
+        # The weekly source closes only on the chart bar whose close coincides
+        # with the weekly close. On history ticks, that commit occurs at q0.
+        # source_idx advances on the first Daily bar where the completed weekly
+        # snapshot is visible, so mark that bar's first execution.
         for t in range(1, nd):
             if source_idx[t] >= 0 and source_idx[t] != source_idx[t - 1]:
-                commit[t, 3] = True
+                commit[t, 0] = True
     else:
-        commit[:, 3] = True
+        # For LTF request.security(..., lookahead_off), the Daily historical bar
+        # owns the last intrabar snapshot. time_close(LTF) coincides with the
+        # Daily close, and barstate.isconfirmed is true on every history tick.
+        commit[:, 0] = True
     return evt, price, direction, commit
 
 
@@ -1083,7 +1094,7 @@ def baseline_trade_ledger(combo,banks,commit_mask,daily,eval_start_ns,fwd_start_
     cfg_idx=[int(combo[i]) for i in range(5)]; guardian_role=int(combo[5]); trigger_role=int(combo[6])
     o=daily["open"].to_numpy(np.float64); h=daily["high"].to_numpy(np.float64); l=daily["low"].to_numpy(np.float64); c=daily["close"].to_numpy(np.float64)
     ons=daily["bar_open_ns"].to_numpy(np.int64); cns=daily["bar_close_ns"].to_numpy(np.int64)
-    reg=[]; guard_last=0; guard_committed=0; position=0; entry_price=np.nan; target=np.nan; entry_ns=0; entry_source=-1; mae=0.0
+    reg=[]; guard_last=0; guard_committed=0; position=0; entry_price=np.nan; target=np.nan; entry_ns=0; entry_day_idx=-1; entry_source=-1; mae=0.0
     pending=0; pending_target=np.nan; pending_source=-1; pending_day=-1; pending_q=-1; pending_ns=0; exit_day=-1; rows=[]; day_ns=86_400_000_000_000
     def dsel(role,t,q): return int(banks[role][2][cfg_idx[role],t,q])
     def store(price_,typ_,bar_,source_):
@@ -1115,15 +1126,15 @@ def baseline_trade_ledger(combo,banks,commit_mask,daily,eval_start_ns,fwd_start_
                 if typ:
                     store(float(p[cfg_idx[src_i],t,q]),typ,t-1,src_i); events.append((src_i,typ))
             if pending and (t>pending_day or (t==pending_day and q>pending_q)) and position==0:
-                position=pending; entry_price=float(px); target=float(pending_target); entry_ns=tick_ns; entry_source=pending_source; signal_ns=pending_ns; signal_q=pending_q; mae=0.0
+                position=pending; entry_price=float(px); target=float(pending_target); entry_ns=tick_ns; entry_day_idx=t; entry_source=pending_source; signal_ns=pending_ns; signal_q=pending_q; mae=0.0
                 pending=0; pending_target=np.nan; pending_source=-1; pending_day=-1; pending_q=-1; pending_ns=0
             if position:
                 mae=max(mae, ((entry_price-px)/pip) if position==1 else ((px-entry_price)/pip)); reached=px>=target if position==1 else px<=target
                 if reached:
                     pnl=((px-entry_price)/pip) if position==1 else ((entry_price-px)/pip); hold=max(0.0,(tick_ns-entry_ns)/day_ns)
                     if tick_ns>=eval_start_ns:
-                        rows.append({"signal_time_utc":pd.to_datetime(signal_ns,utc=True).isoformat(),"entry_time_utc":pd.to_datetime(entry_ns,utc=True).isoformat(),"exit_time_utc":pd.to_datetime(tick_ns,utc=True).isoformat(),"source_R":SLOT_ORDER[entry_source],"side":"LONG" if position==1 else "SHORT","entry":entry_price,"target":target,"exit":float(px),"pips":float(pnl),"mae_pips":float(mae),"hold_days":float(hold),"in_last_30d":bool(tick_ns>=fwd_start_ns),"signal_tick":int(signal_q)})
-                    position=0; entry_price=np.nan; target=np.nan; entry_ns=0; entry_source=-1; mae=0.0; exit_day=t; continue
+                        rows.append({"signal_time_utc":pd.to_datetime(signal_ns,utc=True).isoformat(),"entry_time_utc":pd.to_datetime(entry_ns,utc=True).isoformat(),"exit_time_utc":pd.to_datetime(tick_ns,utc=True).isoformat(),"entry_day_index":int(entry_day_idx),"entry_price":float(entry_price),"exit_price":float(px),"source_R":SLOT_ORDER[entry_source],"side":"LONG" if position==1 else "SHORT","entry":entry_price,"target":target,"exit":float(px),"pips":float(pnl),"mae_pips":float(mae),"hold_days":float(hold),"in_last_30d":bool(tick_ns>=fwd_start_ns),"signal_tick":int(signal_q)})
+                    position=0; entry_price=np.nan; target=np.nan; entry_ns=0; entry_day_idx=-1; entry_source=-1; mae=0.0; exit_day=t; continue
             if tick_ns<eval_start_ns or position or pending or exit_day==t or not events: continue
             for src_i,typ in events:
                 cand=1 if typ==1 else -1
@@ -1133,10 +1144,124 @@ def baseline_trade_ledger(combo,banks,commit_mask,daily,eval_start_ns,fwd_start_
                 pending=cand; pending_target=tgt; pending_source=src_i; pending_day=t; pending_q=q; pending_ns=tick_ns; break
     return pd.DataFrame(rows)
 
+
+TV_CONTROL_TRADES = [
+    ("2026-04-28",-1,1.17218,1.16775),
+    ("2026-04-30", 1,1.16789,1.17418),
+    ("2026-05-04",-1,1.17478,1.16810),
+    ("2026-05-06", 1,1.16924,1.17967),
+    ("2026-05-12",-1,1.17878,1.17218),
+    ("2026-05-19",-1,1.16558,1.15922),
+    ("2026-05-20",-1,1.16055,1.15828),
+    ("2026-05-22",-1,1.16194,1.15883),
+    ("2026-05-27",-1,1.16615,1.16258),
+    ("2026-06-01",-1,1.16543,1.16068),
+    ("2026-06-02",-1,1.16558,1.16310),
+    ("2026-06-04",-1,1.16455,1.16110),
+    ("2026-06-08",-1,1.15548,1.15030),
+    ("2026-06-17",-1,1.16098,1.14779),
+    ("2026-06-23",-1,1.14391,1.13757),
+    ("2026-06-25",-1,1.13618,1.13335),
+    ("2026-06-30", 1,1.14244,1.14367),
+    ("2026-07-02", 1,1.13750,1.14730),
+    ("2026-07-07",-1,1.14420,1.14080),
+    ("2026-07-08",-1,1.14316,1.13912),
+    ("2026-07-09", 1,1.14186,1.14494),
+    ("2026-07-10",-1,1.14329,1.14116),
+    ("2026-07-14", 1,1.13843,1.14628),
+    ("2026-07-15", 1,1.14060,1.14824),
+    ("2026-07-20",-1,1.14268,1.13974),
+    ("2026-07-27",-1,1.13958,1.13670),
+    ("2026-07-28", 1,1.13686,1.14053),
+    ("2026-07-31", 1,1.15261,1.15476),
+    ("2026-08-03", 1,1.15004,1.15341),
+    ("2026-08-05", 1,1.15268,1.15594),
+    ("2026-08-06", 1,1.15147,1.15808),
+    ("2026-08-10", 1,1.15400,1.15634),
+    ("2026-08-19", 1,1.15702,1.16792),
+    ("2026-08-20", 1,1.16770,1.17105),
+    ("2026-08-21", 1,1.16783,1.17116),
+    ("2026-08-24", 1,1.16553,1.16798),
+]
+
+def _json_native(x):
+    """Recursively convert NumPy/Pandas scalars into json.dumps-safe Python types."""
+    if isinstance(x, dict):
+        return {str(k): _json_native(v) for k,v in x.items()}
+    if isinstance(x, (list,tuple)):
+        return [_json_native(v) for v in x]
+    if isinstance(x, np.generic):
+        return x.item()
+    if isinstance(x, pd.Timestamp):
+        return x.isoformat()
+    if isinstance(x, np.ndarray):
+        return [_json_native(v) for v in x.tolist()]
+    return x
+
+def _tv_trade_alignment(ledger: pd.DataFrame, daily: pd.DataFrame):
+    """
+    Compare BASE trades to the exact TradingView control at Daily trading-date + side.
+    Pine/TradingView displays the Forex trading date; for our OANDA-aligned Daily frame
+    that is represented by the Daily bar CLOSE date.
+    """
+    tv = [{"date":d, "dir":int(side), "entry":float(ep), "exit":float(xp)}
+          for d,side,ep,xp in TV_CONTROL_TRADES]
+
+    py = []
+    if ledger is not None and len(ledger):
+        for _,r in ledger.iterrows():
+            day_idx = int(r.get("entry_day_index",-1))
+            if 0 <= day_idx < len(daily):
+                td = pd.to_datetime(int(daily["bar_close_ns"].iloc[day_idx]), utc=True).date().isoformat()
+            else:
+                # Fallback if an older ledger shape is encountered.
+                td = pd.Timestamp(r["entry_time_utc"]).date().isoformat()
+            side = 1 if str(r.get("side","")).upper() == "LONG" else -1
+            py.append({
+                "date":td, "dir":side,
+                "entry":float(r.get("entry_price",np.nan)),
+                "exit":float(r.get("exit_price",np.nan)),
+                "source":str(r.get("source_R","")),
+            })
+
+    # Sequence comparison is the strongest diagnostic because TV is one-trade-at-a-time.
+    seq_matches = 0
+    first_div = None
+    for i in range(max(len(tv),len(py))):
+        t = tv[i] if i < len(tv) else None
+        p = py[i] if i < len(py) else None
+        if t is not None and p is not None and t["date"] == p["date"] and t["dir"] == p["dir"]:
+            seq_matches += 1
+        elif first_div is None:
+            first_div = {"index_1based":i+1, "tv":t, "python":p}
+
+    tv_keys=[(x["date"],x["dir"]) for x in tv]
+    py_keys=[(x["date"],x["dir"]) for x in py]
+    missing=[]
+    temp=list(py_keys)
+    for k in tv_keys:
+        if k in temp: temp.remove(k)
+        else: missing.append(k)
+    extra=[]
+    temp=list(tv_keys)
+    for k in py_keys:
+        if k in temp: temp.remove(k)
+        else: extra.append(k)
+
+    return {
+        "tv_trade_count":len(tv),
+        "python_trade_count":len(py),
+        "sequence_date_side_matches":seq_matches,
+        "missing_tv_date_side":[{"date":d,"side":"LONG" if side==1 else "SHORT"} for d,side in missing],
+        "extra_python_date_side":[{"date":d,"side":"LONG" if side==1 else "SHORT"} for d,side in extra],
+        "first_sequence_divergence":first_div,
+        "python_trades":py,
+    }
+
 def main() -> int:
     print("=" * 72, flush=True)
     print(f"TGIM SWEEPER BUILD: {BUILD_ID}", flush=True)
-    print("ARCHITECTURE: FIVE-R REDLINE PARITY v2.3 | ANY-ROUTE CONTROL | 4-MODE PARITY MATRIX", flush=True)
+    print("ARCHITECTURE: FIVE-R EXACT PARITY v2.4 | TV 36/36 LEDGER | HISTORY-COMMIT FIX", flush=True)
     print("=" * 72, flush=True)
     ap = argparse.ArgumentParser(
         description="TGIM Redline five-R joint rail-family/length + Guardian/Trigger optimizer."
@@ -1150,9 +1275,9 @@ def main() -> int:
     ap.add_argument("--forward-days", type=int, default=30)
 
     ap.add_argument("--lengths", default="3,5,8,13,21,27,34")
-    ap.add_argument("--registry-limit", type=int, default=27, choices=[20,27])
+    ap.add_argument("--registry-limit", type=int, default=20, choices=[20,27])
     ap.add_argument("--target-scope", choices=["any","same"], default="any",
-                    help="Production control is Any Route R; Same R is diagnostic.")
+                    help="Production BASE is always Any Route R in v2.4; retained only for CLI compatibility.")
 
     ap.add_argument("--expected-total", type=int, default=None)
     ap.add_argument("--expected-forward", type=int, default=None)
@@ -1217,7 +1342,11 @@ def main() -> int:
     print(f"[2/10] Building {len(lengths)*len(FAMILIES)} rail candidates per R bay ...")
     cfgs = coarse_cfgs(lengths)
 
-    # Build BOTH plausible Daily-history semantics. Everything else is identical.
+    # Current TradingView control is exact and known from the exported Properties sheet:
+    # Any Route R / One Leg Only / registry 20 / clutter OFF / R2 Guardian+Trigger.
+    # LTF request.security(... lookahead_off) is the last intrabar snapshot. The only
+    # remaining BASE uncertainty worth testing is whether same-TF Daily rail state is
+    # dynamic across history ticks or presented as finalized throughout the bar.
     banks_dynamic, commit_dynamic = prepare_banks(raw,daily,cfgs,daily_mode="dynamic")
     banks_static,  commit_static  = prepare_banks(raw,daily,cfgs,daily_mode="static")
 
@@ -1229,140 +1358,115 @@ def main() -> int:
     cns = daily["bar_close_ns"].to_numpy(np.int64)
     pip = pip_size(instrument)
 
-    expected_total = args.expected_total
-    if expected_total is None:
-        expected_total = EXPECTED_TOTAL.get(instrument)
-
-    expected_forward = args.expected_forward
-    if expected_forward is None:
-        expected_forward = EXPECTED_FORWARD.get(instrument)
-
+    expected_total = args.expected_total if args.expected_total is not None else EXPECTED_TOTAL.get(instrument)
+    expected_forward = args.expected_forward if args.expected_forward is not None else EXPECTED_FORWARD.get(instrument)
     bc = baseline_combo(cfgs)
 
-    print("[3/10] BASE parity matrix ...")
-    matrix_specs = [
-        ("DYNAMIC_D + ANY_ROUTE", banks_dynamic, commit_dynamic, False),
-        ("STATIC_D  + ANY_ROUTE", banks_static,  commit_static,  False),
-        ("DYNAMIC_D + SAME_R",    banks_dynamic, commit_dynamic, True),
-        ("STATIC_D  + SAME_R",    banks_static,  commit_static,  True),
+    print("[3/10] EXACT BASE certification against TradingView 36/36 ledger ...")
+    modes = [
+        ("STATIC_D + ANY_ROUTE + HISTORY_COMMIT_Q0",  banks_static,  commit_static),
+        ("DYNAMIC_D + ANY_ROUTE + HISTORY_COMMIT_Q0", banks_dynamic, commit_dynamic),
     ]
 
-    matrix_rows = []
-    exact_any = []
-    for label, mbanks, mcommit, same_only in matrix_specs:
+    mode_rows=[]
+    candidates=[]
+    for label,mbanks,mcommit in modes:
         mm = simulate_many(
-            bc,
-            *mbanks[0],*mbanks[1],*mbanks[2],*mbanks[3],*mbanks[4],mcommit,
-            o,h,l,c,ons,cns,eval_start_ns,fwd_start_ns,pip,args.registry_limit,same_only
+            bc,*mbanks[0],*mbanks[1],*mbanks[2],*mbanks[3],*mbanks[4],mcommit,
+            o,h,l,c,ons,cns,eval_start_ns,fwd_start_ns,pip,args.registry_limit,False
         )[0]
-        md = metric_dict(mm)
-        exact = True
-        if expected_total is not None:
-            exact = exact and md["closed_120d"] == expected_total and md["wins_120d"] == expected_total
-        if expected_forward is not None:
-            exact = exact and md["closed_30d"] == expected_forward and md["wins_30d"] == expected_forward
-
-        print(f"       {label:<23} | 120d {md['closed_120d']}/{md['wins_120d']}"
+        md=metric_dict(mm)
+        ledger=baseline_trade_ledger(
+            bc[0],mbanks,mcommit,daily,eval_start_ns,fwd_start_ns,pip,args.registry_limit,False
+        )
+        align=_tv_trade_alignment(ledger,daily)
+        exact_counts=(md["closed_120d"]==expected_total and md["wins_120d"]==expected_total
+                      and md["closed_30d"]==expected_forward and md["wins_30d"]==expected_forward)
+        exact_ledger=(align["sequence_date_side_matches"]==36 and len(align["missing_tv_date_side"])==0
+                      and len(align["extra_python_date_side"])==0)
+        exact=bool(exact_counts and exact_ledger)
+        print(f"       {label:<44} | 120d {md['closed_120d']}/{md['wins_120d']}"
               f" | 30d {md['closed_30d']}/{md['wins_30d']}"
+              f" | TV-seq {align['sequence_date_side_matches']}/36"
               f" | MAE {md['max_mae_pips_120d']:.2f}"
-              f" | longest {md['longest_days_120d']:.2f}d"
               f" | {'EXACT' if exact else 'MISS'}")
+        if align["first_sequence_divergence"] is not None:
+            fd=align["first_sequence_divergence"]
+            print(f"         first divergence #{fd['index_1based']}: TV={fd['tv']} | PY={fd['python']}")
+        mode_rows.append({"mode":label,"exact":exact,**md,
+                          "tv_sequence_matches":align["sequence_date_side_matches"],
+                          "tv_missing":len(align["missing_tv_date_side"]),
+                          "python_extra":len(align["extra_python_date_side"])})
+        candidates.append((exact,label,mbanks,mcommit,md,ledger,align))
 
-        matrix_rows.append({
-            "mode":label,
-            "daily_mode":"dynamic" if label.startswith("DYNAMIC") else "static",
-            "target_scope":"same" if same_only else "any",
-            "exact":bool(exact),
-            **md,
-        })
-        if exact and not same_only:
-            exact_any.append((label,mbanks,mcommit,same_only,md))
+    pd.DataFrame(mode_rows).to_csv(result_dir/"BASE_PARITY_MATRIX.csv",index=False)
 
-    matrix_df = pd.DataFrame(matrix_rows)
-    matrix_df.to_csv(result_dir/"BASE_PARITY_MATRIX.csv",index=False)
-
-    # Production settings show Any Route R. Only an Any-Route exact parity mode
-    # is allowed to unlock millions of optimization systems.
-    if exact_any:
-        label,banks,commit_mask,same_rail_only,base_metrics = exact_any[0]
-        certified = True
-        selected_daily_mode = "dynamic" if label.startswith("DYNAMIC") else "static"
-        selected_scope = "any"
-        print(f"       SELECTED PARITY MODEL: {label}")
+    exact_candidates=[x for x in candidates if x[0]]
+    if exact_candidates:
+        _,label,banks,commit_mask,base_metrics,base_ledger,alignment=exact_candidates[0]
+        certified=True
+        selected_daily_mode="static" if label.startswith("STATIC") else "dynamic"
+        same_rail_only=False
+        selected_scope="any"
+        print(f"       SELECTED EXACT MODEL: {label}")
     else:
-        # Use requested production mode only to generate a forensic ledger.
-        selected_daily_mode = "dynamic"
-        same_rail_only = (args.target_scope == "same")
-        banks = banks_dynamic
-        commit_mask = commit_dynamic
-        selected_scope = args.target_scope
-        preferred_label = "DYNAMIC_D + " + ("SAME_R" if same_rail_only else "ANY_ROUTE")
-        pref = matrix_df.loc[matrix_df["mode"] == preferred_label]
-        if len(pref):
-            p = pref.iloc[0]
-            base_metrics = {
-                k: p[k] for k in (
-                    "entries_120d","closed_120d","wins_120d","win_pct_120d",
-                    "net_pips_120d","max_mae_pips_120d","longest_days_120d",
-                    "avg_hold_days_120d","entries_30d","closed_30d","wins_30d",
-                    "win_pct_30d","net_pips_30d","open_or_pending_end","completion_pct_120d"
-                )
-            }
-        else:
-            base_metrics = metric_dict(simulate_many(
-                bc,*banks[0],*banks[1],*banks[2],*banks[3],*banks[4],commit_mask,
-                o,h,l,c,ons,cns,eval_start_ns,fwd_start_ns,pip,args.registry_limit,same_rail_only
-            )[0])
-        certified = False
+        # Keep STATIC + ANY as forensic default because TradingView explicitly returns
+        # the last intrabar for LTF requests and the earlier matrix showed it closest.
+        _,label,banks,commit_mask,base_metrics,base_ledger,alignment=candidates[0]
+        certified=False
+        selected_daily_mode="static"
+        same_rail_only=False
+        selected_scope="any"
 
-    print("       BASE:", " | ".join(
-        f"{slot} {BASELINE[slot][0]}{BASELINE[slot][1]} RAW" for slot in SLOT_ORDER
-    ))
-    print(f"       Guardian={BASE_GUARDIAN} | Trigger={BASE_TRIGGER}"
-          f" | target-scope={selected_scope.upper()}"
-          f" | daily={selected_daily_mode.upper()}"
-          f" | registry={args.registry_limit}")
-
-    base_ledger = baseline_trade_ledger(
-        bc[0],banks,commit_mask,daily,eval_start_ns,fwd_start_ns,pip,args.registry_limit,same_rail_only
-    )
     base_ledger.to_csv(result_dir/"BASELINE_TRADE_LEDGER.csv",index=False)
+    (result_dir/"TV_ALIGNMENT.json").write_text(json.dumps(_json_native(alignment),indent=2))
 
     cert = {
         "instrument":instrument,
         "build_id":BUILD_ID,
         "expected_total":expected_total,
         "expected_forward":expected_forward,
-        "production_target_scope":"Any Route R",
-        "selected_daily_mode":selected_daily_mode,
-        "selected_target_scope":selected_scope,
+        "exact_exported_properties":{
+            "target_scope":"Any Route R",
+            "after_target_exit":"One Leg Only",
+            "registry_limit":args.registry_limit,
+            "clutter":"OFF",
+            "guardian":"R2",
+            "trigger":"R2",
+            "history_bar_tick":True,
+            "bar_detailization":"Default 4 ticks",
+            "order_execution_delay":"One tick",
+        },
         "baseline":{
             **{slot:{"tf":SLOT_TF[slot],"family":BASELINE[slot][0],"length":BASELINE[slot][1],"working":"RAW"}
                for slot in SLOT_ORDER},
-            "guardian":BASE_GUARDIAN,
-            "trigger":BASE_TRIGGER,
-            "registry_limit":args.registry_limit,
         },
+        "selected_daily_mode":selected_daily_mode,
         "metrics":base_metrics,
+        "alignment":alignment,
         "certified":bool(certified),
-        "parity_matrix":matrix_rows,
+        "mode_matrix":mode_rows,
     }
-    (result_dir/"BASE_CERTIFICATION.json").write_text(json.dumps(cert,indent=2))
+    (result_dir/"BASE_CERTIFICATION.json").write_text(json.dumps(_json_native(cert),indent=2))
 
-    print(f"       Parity ledger: {len(base_ledger)} closed trades -> {result_dir/'BASELINE_TRADE_LEDGER.csv'}")
-    if len(base_ledger):
-        for _,r in base_ledger.tail(5).iterrows():
-            print(f"         {r['entry_time_utc']} | {r['source_R']} {r['side']}"
-                  f" | {r['pips']:.1f}p | MAE {r['mae_pips']:.1f} | {r['hold_days']:.2f}d")
+    print(f"       TV reference trades: 36 | Python ledger: {len(base_ledger)}")
+    print(f"       Sequence date/side matches: {alignment['sequence_date_side_matches']}/36")
+    print(f"       Missing TV trades: {len(alignment['missing_tv_date_side'])}"
+          f" | Extra Python trades: {len(alignment['extra_python_date_side'])}")
+    if alignment["missing_tv_date_side"]:
+        print("       First missing:", alignment["missing_tv_date_side"][:5])
+    if alignment["extra_python_date_side"]:
+        print("       First extra:  ", alignment["extra_python_date_side"][:5])
     print()
 
     if not certified and not args.force_sweep:
         print("\nBASE MISMATCH — REDLINE SWEEP ABORTED.")
-        print("None of the Any-Route parity modes reproduced the production control.")
-        print("The 4-mode matrix above isolates target-scope vs Daily-history semantics before another code change.")
-        print(f"Parity matrix:      {result_dir/'BASE_PARITY_MATRIX.csv'}")
-        print(f"Certification file:{result_dir/'BASE_CERTIFICATION.json'}")
-        print(f"Trade ledger:       {result_dir/'BASELINE_TRADE_LEDGER.csv'}")
+        print("The optimizer remains locked, but this run is no longer aggregate-only.")
+        print("It compared Python directly to all 36 TradingView entry dates/sides.")
+        print(f"Parity matrix:       {result_dir/'BASE_PARITY_MATRIX.csv'}")
+        print(f"TV alignment:        {result_dir/'TV_ALIGNMENT.json'}")
+        print(f"Certification file: {result_dir/'BASE_CERTIFICATION.json'}")
+        print(f"Trade ledger:        {result_dir/'BASELINE_TRADE_LEDGER.csv'}")
         print("Do NOT force-sweep a mismatched model.")
         return 2
 
