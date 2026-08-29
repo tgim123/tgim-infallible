@@ -1,39 +1,54 @@
 #!/usr/bin/env python3
 """
-TGIM ROLE-FIRST + ROUTE-COMPOSITION SWEEPER v3.1
-==================================================
+TGIM MACRO/MICRO PAIR SWEEPER v3.2
+================================
 
-BUILD ID: TGIM-ROLE-FIRST-V3.1-ROUTECOMP-20260829
+BUILD ID: TGIM-MACRO-MICRO-V3.2-20260829
 
 Purpose
 -------
-The first optimization dimension for a new pair is Guardian Timeframe Source R
-and Trigger Timeframe Source R.  Guardian/Trigger independent MA profiles are
-FORCED OFF in this stage.  The selected role consumes the chosen R bay exactly.
+TGIM does not need every available R bay.  The route architecture is treated as
+MACRO + MICRO first: find the smallest two-rail structure that best captures the
+pair's large-scale direction and small-scale travel/checkpoints.
 
-This build deliberately does NOT aim for 51/51 on every instrument.  51/51
-AUDUSD and 47/47 EURUSD are seed/reference math profiles only.  Every pair is
-ranked on its own results.  Route participation is NOT inherited as a fixed truth:
-a pair may use one route rail, three, four, seven, or all ten if that is what wins.
+Guardian and Trigger are still discovered independently first, with both
+independent MA profiles FORCED OFF.  Guardian/Trigger may be route rails or may
+remain calculation-only role rails.
+
+Extra route rails must EARN their place.  After the best Macro/Micro structures
+are found, one optional bridge rail is tested.  A bridge is carried forward only
+when it strictly improves the trading result.  A fourth rail is tested only from
+bridge structures that already improved on their two-rail parent.  Equal results
+do not justify extra complexity.
+
+This build deliberately does NOT aim for 51/51 on every instrument.  AUDUSD
+51/51 and EURUSD 47/47 remain seed/reference math families only.  Every pair
+competes against itself.
 
 Default staged run
 ------------------
-1) For each seed MATH family (AUD51 and EUR47), test the four high-priority roles:
+1) Priority Guardian/Trigger source sweep:
        G R1 / T R1
        G R1 / T R2
        G R2 / T R1
        G R2 / T R2
-2) Expand Guardian x Trigger to all R1..R10 (100 combinations per seed).
-3) Carry the strongest role relationships PER SEED (plus the R1/R2 priority set)
-   into an exhaustive ROUTE-COMPOSITION sweep.  By default every non-empty subset
-   of R1..R10 is tested: 2^10 - 1 = 1,023 possible route-ray populations.
-   Guardian and Trigger do NOT have to be route rails; they can remain role-only.
-4) Rank each instrument independently:
+2) Expand Guardian x Trigger to all R1..R10.
+3) Carry the strongest role relationships per seed into an exhaustive
+   MACRO/MICRO route-pair sweep: C(10,2) = 45 two-rail structures.
+   Because R1..R10 are ordered slow -> fast, the slower selected R is labeled
+   Macro and the faster selected R is labeled Micro.
+4) Carry the strongest Macro/Micro structures into a BRIDGE challenge.  Test each
+   remaining R as a third route rail, but keep it only if the child strictly
+   improves on its exact two-rail parent.
+5) Only from bridge structures that earned their place, challenge one FOURTH rail.
+   Again, it survives only if it strictly improves on its three-rail parent.
+6) Final ranking:
        zero closed losses / 100% first
        then more closed trades
        then net pips
        then lower max MAE
        then shorter average hold
+       then more recent opportunities
        then, only as a final tie-breaker, fewer route rails
 
 Fixed trade architecture for this stage
@@ -49,9 +64,9 @@ Fixed trade architecture for this stage
 - Guardian independent profile OFF
 - Trigger independent profile OFF
 
-Seed route profiles
--------------------
-AUD51 (current AUDUSD 51/51 manual champion family):
+Seed math profiles
+------------------
+AUD51 (current AUDUSD 51/51 manual champion math family; listed route flags are seed history only):
     R1  1W   EMA2  RAW   route ON
     R2  1D   KS2   RAW   route ON
     R3  12H  HMA28 RAW   route OFF
@@ -63,7 +78,7 @@ AUD51 (current AUDUSD 51/51 manual champion family):
     R9  5m   KS27  RAW   route ON
     R10 1m   KS2   RAW   route ON
 
-EUR47 (EURUSD GT47 seed family):
+EUR47 (EURUSD GT47 seed math family; listed route flags are seed history only):
     R1  1W   WMA2  RAW   route ON
     R2  1D   WMA2  RAW   route ON
     R3  12H  HMA28 RAW   route OFF
@@ -78,9 +93,10 @@ EUR47 (EURUSD GT47 seed family):
 Important
 ---------
 This is a research/ranking program.  It cannot place orders.  TradingView Pine
-remains the final promotion verifier.  Stage 1 discovers role sources; Stage 2
-removes the fixed-route assumption and searches route membership itself before
-any later MA-family/length/RAW-ZAG mutation.
+remains the final promotion verifier.  The seed route flags above are NOT treated
+as required route membership in Macro/Micro discovery.  The default run carries
+all 100 Guardian/Trigger relationships per seed into all 45 two-rail route pairs,
+then lets only statistically useful extra rails survive.
 """
 
 from __future__ import annotations
@@ -105,7 +121,7 @@ try:
 except Exception as exc:
     raise SystemExit(f"numba is required: {exc}")
 
-BUILD_ID = "TGIM-ROLE-FIRST-V3.1-ROUTECOMP-20260829"
+BUILD_ID = "TGIM-MACRO-MICRO-V3.2-20260829"
 SLOTS = tuple(f"R{i}" for i in range(1, 11))
 SLOT_INDEX = {s: i for i, s in enumerate(SLOTS)}
 TF = {
@@ -629,17 +645,38 @@ def _route_slots_from_mask(route_on: np.ndarray) -> Tuple[str,...]:
     return tuple(SLOTS[i] for i in range(10) if bool(route_on[i]))
 
 
-def route_subsets(min_rails: int=1, max_rails: int=10) -> List[Tuple[str,...]]:
-    min_rails=max(1,min_rails); max_rails=min(10,max_rails)
-    if min_rails>max_rails:
-        raise ValueError("route min rails cannot exceed route max rails")
-    # Test 3/4-rail structures early for useful live progress, then the rest.
-    preferred=[3,4,2,5,1,6,7,8,9,10]
-    sizes=[n for n in preferred if min_rails<=n<=max_rails]
-    out=[]
-    for n in sizes:
-        out.extend(itertools.combinations(SLOTS,n))
-    return out
+def _ordered_route_slots(slots) -> Tuple[str,...]:
+    ss=set(slots)
+    return tuple(s for s in SLOTS if s in ss)
+
+
+def macro_micro_pairs() -> List[Tuple[str,str]]:
+    # R1..R10 are ordered slow -> fast, so combinations naturally yield
+    # (Macro, Micro) without forcing Guardian or Trigger to live on either rail.
+    return list(itertools.combinations(SLOTS,2))
+
+
+def performance_key(row) -> tuple:
+    """Lexicographic quality key used to decide whether an extra rail earns its place.
+
+    Route count is intentionally excluded.  A child must improve actual trading
+    behavior; merely adding complexity with identical statistics is NOT an improvement.
+    """
+    get=lambda k,d=0.0: float(row[k]) if k in row and pd.notna(row[k]) else d
+    perfect=1 if get("losses_120d") == 0 and get("closed_120d") > 0 else 0
+    return (
+        perfect,
+        get("win_rate_120d"),
+        get("closed_120d"),
+        get("net_pips_120d"),
+        -get("max_mae_pips_120d",999999.0),
+        -get("avg_hold_days_120d",999999.0),
+        get("closed_30d"),
+    )
+
+
+def strictly_improves(child, parent) -> bool:
+    return performance_key(child) > performance_key(parent)
 
 
 def run_seed(seed: SeedProfile, arrays, daily, inst, eval_start_ns, fwd_start_ns, registry_limit, scope: str) -> pd.DataFrame:
@@ -650,11 +687,14 @@ def run_seed(seed: SeedProfile, arrays, daily, inst, eval_start_ns, fwd_start_ns
     rows=[]
     for g,tr in role_pairs(scope,route_on):
         m=_simulate_role_pair(SLOT_INDEX[g],SLOT_INDEX[tr],evt,ray_price,dirs,commits,route_on,o,h,l,c,ons,cns,eval_start_ns,fwd_start_ns,pip,registry_limit)
-        rows.append(metric_row(seed.name,g,tr,m,{},seed_routes))
+        row=metric_row(seed.name,g,tr,m,{},seed_routes)
+        row.update({"macro":"","micro":"","bridge_rail":"","fourth_rail":"","generation":0,
+                    "parent_route_slots":"","earned_addition":False})
+        rows.append(row)
     return rank_df(pd.DataFrame(rows))
 
 
-def select_route_role_candidates(expanded: pd.DataFrame, per_seed: int, carry_priority: bool=True) -> pd.DataFrame:
+def select_role_candidates(expanded: pd.DataFrame, per_seed: int, carry_priority: bool=True) -> pd.DataFrame:
     parts=[]
     for seed_name,grp in expanded.groupby("seed",sort=False):
         parts.append(rank_df(grp).head(per_seed))
@@ -668,24 +708,92 @@ def select_route_role_candidates(expanded: pd.DataFrame, per_seed: int, carry_pr
     return rank_df(z)
 
 
-def run_route_composition(role_candidates: pd.DataFrame, arrays_by_seed, daily, inst, eval_start_ns, fwd_start_ns, registry_limit, min_rails: int, max_rails: int) -> pd.DataFrame:
-    o=daily.open.to_numpy(float); h=daily.high.to_numpy(float); l=daily.low.to_numpy(float); c=daily.close.to_numpy(float)
-    ons=daily.bar_open_ns.to_numpy(np.int64); cns=daily.bar_close_ns.to_numpy(np.int64); pip=pip_size(inst)
-    subsets=route_subsets(min_rails,max_rails)
-    rows=[]; total=len(role_candidates)*len(subsets); done=0
-    print(f"      Route subsets per role candidate: {len(subsets):,} | joint tests: {total:,}")
+def _sim_inputs(daily, inst):
+    return (
+        daily.open.to_numpy(float), daily.high.to_numpy(float), daily.low.to_numpy(float), daily.close.to_numpy(float),
+        daily.bar_open_ns.to_numpy(np.int64), daily.bar_close_ns.to_numpy(np.int64), pip_size(inst)
+    )
+
+
+def _simulate_routes(seed_name, g, tr, slots, arrays_by_seed, sim_inputs, eval_start_ns, fwd_start_ns, registry_limit):
+    evt,ray_price,dirs,commits,_seed_route=arrays_by_seed[seed_name]
+    o,h,l,c,ons,cns,pip=sim_inputs
+    route_on=np.zeros(10,np.bool_)
+    for s in slots: route_on[SLOT_INDEX[s]]=True
+    return _simulate_role_pair(
+        SLOT_INDEX[g],SLOT_INDEX[tr],evt,ray_price,dirs,commits,route_on,
+        o,h,l,c,ons,cns,eval_start_ns,fwd_start_ns,pip,registry_limit
+    )
+
+
+def run_macro_micro(role_candidates: pd.DataFrame, arrays_by_seed, daily, inst, eval_start_ns, fwd_start_ns, registry_limit) -> pd.DataFrame:
+    pairs=macro_micro_pairs(); sim_inputs=_sim_inputs(daily,inst)
+    rows=[]; total=len(role_candidates)*len(pairs); done=0
+    print(f"      Macro/Micro pairs per role candidate: {len(pairs):,} | joint tests: {total:,}")
     for _,cand in role_candidates.iterrows():
         seed_name=str(cand.seed); g=str(cand.guardian); tr=str(cand.trigger)
-        evt,ray_price,dirs,commits,_seed_route=arrays_by_seed[seed_name]
-        for slots in subsets:
-            route_on=np.zeros(10,np.bool_)
-            for s in slots: route_on[SLOT_INDEX[s]]=True
-            m=_simulate_role_pair(SLOT_INDEX[g],SLOT_INDEX[tr],evt,ray_price,dirs,commits,route_on,o,h,l,c,ons,cns,eval_start_ns,fwd_start_ns,pip,registry_limit)
-            rows.append(metric_row(seed_name,g,tr,m,{},slots))
-            done+=1
-            if done % 1000 == 0 or done==total:
-                print(f"      route composition progress: {done:,}/{total:,}")
+        for macro,micro in pairs:
+            slots=(macro,micro)
+            m=_simulate_routes(seed_name,g,tr,slots,arrays_by_seed,sim_inputs,eval_start_ns,fwd_start_ns,registry_limit)
+            row=metric_row(seed_name,g,tr,m,{},slots)
+            row.update({"macro":macro,"micro":micro,"bridge_rail":"","fourth_rail":"","generation":2,
+                        "parent_route_slots":"","earned_addition":True,
+                        "delta_closed":0,"delta_net_pips":0.0,"delta_win_rate":0.0,"delta_mae_pips":0.0})
+            rows.append(row); done+=1
+            if done % 500 == 0 or done==total:
+                print(f"      macro/micro progress: {done:,}/{total:,}")
     return rank_df(pd.DataFrame(rows))
+
+
+def select_route_candidates(df: pd.DataFrame, per_seed: int) -> pd.DataFrame:
+    if df.empty: return df
+    parts=[]
+    for _,grp in df.groupby("seed",sort=False):
+        parts.append(rank_df(grp).head(per_seed))
+    z=pd.concat(parts,ignore_index=True) if parts else df.head(0)
+    if z.empty: return z
+    return rank_df(z.drop_duplicates(["seed","guardian","trigger","route_slots"],keep="first"))
+
+
+def run_added_rail_challenge(parents: pd.DataFrame, arrays_by_seed, daily, inst, eval_start_ns, fwd_start_ns,
+                             registry_limit, generation: int) -> Tuple[pd.DataFrame,pd.DataFrame]:
+    """Challenge one additional route rail against each exact parent.
+
+    generation=3 adds the bridge rail to a Macro/Micro parent.
+    generation=4 adds a fourth rail only to an already-earned three-rail parent.
+    """
+    sim_inputs=_sim_inputs(daily,inst); rows=[]
+    total=sum(10-len(tuple(x for x in str(r.route_slots).split(",") if x)) for _,r in parents.iterrows())
+    done=0
+    label="bridge" if generation==3 else "fourth"
+    print(f"      {label.title()} challenges: {total:,}")
+    for _,parent in parents.iterrows():
+        seed_name=str(parent.seed); g=str(parent.guardian); tr=str(parent.trigger)
+        base_slots=tuple(x for x in str(parent.route_slots).split(",") if x)
+        base_set=set(base_slots)
+        for add in SLOTS:
+            if add in base_set: continue
+            slots=_ordered_route_slots(base_slots+(add,))
+            m=_simulate_routes(seed_name,g,tr,slots,arrays_by_seed,sim_inputs,eval_start_ns,fwd_start_ns,registry_limit)
+            row=metric_row(seed_name,g,tr,m,{},slots)
+            row.update({
+                "macro":str(parent.get("macro","")),"micro":str(parent.get("micro","")),
+                "bridge_rail": add if generation==3 else str(parent.get("bridge_rail","")),
+                "fourth_rail": add if generation==4 else "",
+                "generation":generation,
+                "parent_route_slots":str(parent.route_slots),
+                "delta_closed":int(row["closed_120d"])-int(parent.closed_120d),
+                "delta_net_pips":float(row["net_pips_120d"])-float(parent.net_pips_120d),
+                "delta_win_rate":float(row["win_rate_120d"])-float(parent.win_rate_120d),
+                "delta_mae_pips":float(row["max_mae_pips_120d"])-float(parent.max_mae_pips_120d),
+            })
+            row["earned_addition"]=strictly_improves(row,parent)
+            rows.append(row); done+=1
+            if done % 250 == 0 or done==total:
+                print(f"      {label} progress: {done:,}/{total:,}")
+    all_df=rank_df(pd.DataFrame(rows)) if rows else pd.DataFrame()
+    earned=rank_df(all_df[all_df.earned_addition].copy()) if not all_df.empty and all_df.earned_addition.any() else all_df.head(0)
+    return all_df,earned
 
 
 def route_profile_manifest(seed: SeedProfile, route_slots) -> dict:
@@ -699,7 +807,7 @@ def route_profile_manifest(seed: SeedProfile, route_slots) -> dict:
 
 
 def parse_args():
-    p=argparse.ArgumentParser(description="TGIM role-first Guardian/Trigger + exhaustive route-composition sweeper")
+    p=argparse.ArgumentParser(description="TGIM Macro/Micro-first Guardian/Trigger + earned-extra-rail sweeper")
     p.add_argument("--instrument",required=False,default="EUR_USD")
     p.add_argument("--token",default=os.getenv("OANDA_TOKEN", ""))
     p.add_argument("--env",choices=["practice","live"],default=os.getenv("OANDA_ENV","practice"))
@@ -710,11 +818,12 @@ def parse_args():
     p.add_argument("--registry-limit",type=int,default=27)
     p.add_argument("--expanded-scope",choices=["active","all10"],default="all10")
     p.add_argument("--skip-expanded",action="store_true")
-    p.add_argument("--skip-route-composition",action="store_true")
-    p.add_argument("--route-role-top-per-seed",type=int,default=10,help="Top expanded G/T relationships per seed carried into route composition")
-    p.add_argument("--route-min-rails",type=int,default=1,help="Minimum number of route-ray R bays to test")
-    p.add_argument("--route-max-rails",type=int,default=10,help="Maximum number of route-ray R bays to test")
-    p.add_argument("--no-route-carry-priority",action="store_true",help="Do not force the four R1/R2 priority role pairs into Stage 2")
+    p.add_argument("--role-top-per-seed",type=int,default=100,help="G/T relationships per seed carried into Macro/Micro discovery; default 100 = every R1-R10 x R1-R10 relationship")
+    p.add_argument("--no-carry-priority",action="store_true",help="Do not force the four R1/R2 priority G/T pairs into Macro/Micro stage")
+    p.add_argument("--macro-micro-top-per-seed",type=int,default=50,help="Top two-rail structures per seed allowed to challenge a bridge rail")
+    p.add_argument("--bridge-top-per-seed",type=int,default=30,help="Top earned three-rail structures per seed allowed to challenge a fourth rail")
+    p.add_argument("--skip-bridge",action="store_true")
+    p.add_argument("--skip-fourth",action="store_true")
     p.add_argument("--refresh",action="store_true")
     p.add_argument("--cache-dir",default="./cache")
     p.add_argument("--result-dir",default="")
@@ -723,7 +832,6 @@ def parse_args():
 
 
 def self_test() -> int:
-    # Exercise the JIT simulator on deterministic synthetic arrays.
     nd=20; evt=np.zeros((10,nd,4),np.int8); rp=np.full((10,nd,4),np.nan); dirs=np.ones((10,nd,4),np.int8); cm=np.zeros((10,nd,4),np.bool_); cm[:,:,0]=True
     route=np.zeros(10,np.bool_); route[0]=route[1]=True
     for t in (3,6,9,12,15):
@@ -732,10 +840,13 @@ def self_test() -> int:
     x=np.linspace(1.0,1.3,nd); o=x.copy(); h=x+0.01; l=x-0.01; c=x+0.005
     ons=np.arange(nd,dtype=np.int64)*86_400_000_000_000; cns=ons+86_400_000_000_000
     m=_simulate_role_pair(0,0,evt,rp,dirs,cm,route,o,h,l,c,ons,cns,0,ons[-5],0.0001,27)
-    assert len(route_subsets(1,10))==1023
-    test=pd.DataFrame([metric_row("X","R1","R2",m,{},("R1","R2","R3")),metric_row("X","R1","R1",m,{},("R1","R2"))])
-    ranked=rank_df(rank_df(test)); assert list(ranked["rank"])==[1,2]
-    print("SELF TEST OK", m.tolist(), "route_subsets=1023"); return 0
+    assert len(macro_micro_pairs())==45
+    a=metric_row("X","R1","R2",m,{},("R1","R2")); b=dict(a); b["net_pips_120d"]=a["net_pips_120d"]+1
+    assert strictly_improves(b,a)
+    c=dict(a); c["route_count"]=3; c["route_slots"]="R1,R2,R3"
+    assert not strictly_improves(c,a)
+    test=pd.DataFrame([a,c]); ranked=rank_df(rank_df(test)); assert list(ranked["rank"])==[1,2]
+    print("SELF TEST OK", m.tolist(), "macro_micro_pairs=45", "earned-extra logic OK"); return 0
 
 
 def main() -> int:
@@ -746,10 +857,8 @@ def main() -> int:
         raise SystemExit("Require 0 < forward-days <= eval-days")
     if args.registry_limit<3 or args.registry_limit>MAX_REGISTRY:
         raise SystemExit(f"registry-limit must be 3..{MAX_REGISTRY}")
-    if args.route_role_top_per_seed<1:
-        raise SystemExit("route-role-top-per-seed must be >= 1")
-    if not (1<=args.route_min_rails<=10 and 1<=args.route_max_rails<=10 and args.route_min_rails<=args.route_max_rails):
-        raise SystemExit("route rail bounds must satisfy 1 <= min <= max <= 10")
+    if args.role_top_per_seed<1 or args.macro_micro_top_per_seed<1 or args.bridge_top_per_seed<1:
+        raise SystemExit("carry counts must all be >= 1")
 
     now=datetime.now(timezone.utc)
     start=now-timedelta(days=args.eval_days+args.warmup_days+30)
@@ -757,8 +866,8 @@ def main() -> int:
     cache=Path(args.cache_dir)
     hist=OandaHistory(args.token,args.env,cache)
 
-    print(f"TGIM ROLE-FIRST + ROUTE-COMPOSITION v3.1 | {inst}")
-    print("[1/7] Fetching fixed R1-R10 timeframe history ...")
+    print(f"TGIM MACRO/MICRO SWEEPER v3.2 | {inst}")
+    print("[1/9] Fetching fixed R1-R10 timeframe history ...")
     raw={}
     for gran in sorted(set(TF.values()), key=lambda x:(x!="D",x)):
         raw[gran]=hist.candles(inst,gran,start,end,args.refresh)
@@ -773,10 +882,10 @@ def main() -> int:
     outdir=Path(args.result_dir) if args.result_dir else Path("results")/f"{inst}_{BUILD_ID}"
     outdir.mkdir(parents=True,exist_ok=True)
 
-    print("[2/7] Preparing all ten R-bay rail/event arrays for each seed math family ...")
+    print("[2/9] Preparing all ten R-bay rail/event arrays for each seed math family ...")
     arrays={s.name:prepare_seed_arrays(raw,daily,s) for s in selected}
 
-    print("[3/7] PRIORITY role sweep: R1/R2 x R1/R2, independent profiles OFF ...")
+    print("[3/9] PRIORITY role sweep: R1/R2 x R1/R2, independent profiles OFF ...")
     pri=[]
     for s in selected:
         pri.append(run_seed(s,arrays[s.name],daily,inst,eval_start_ns,fwd_start_ns,args.registry_limit,"priority"))
@@ -786,7 +895,7 @@ def main() -> int:
 
     expanded=priority
     if not args.skip_expanded:
-        print(f"[4/7] EXPANDED role sweep: {args.expanded_scope} Guardian x Trigger ...")
+        print(f"[4/9] EXPANDED role sweep: {args.expanded_scope} Guardian x Trigger ...")
         allrows=[]
         for s in selected:
             allrows.append(run_seed(s,arrays[s.name],daily,inst,eval_start_ns,fwd_start_ns,args.registry_limit,args.expanded_scope))
@@ -794,49 +903,83 @@ def main() -> int:
         expanded.to_csv(outdir/"STAGE1_EXPANDED_GUARD_TRIGGER.csv",index=False)
         print(expanded[["rank","seed","guardian","trigger","closed_120d","wins_120d","losses_120d","win_rate_120d","closed_30d","net_pips_120d"]].head(20).to_string(index=False))
     else:
-        print("[4/7] Expanded sweep skipped by request; route composition will use priority roles only.")
+        print("[4/9] Expanded sweep skipped; Macro/Micro uses priority roles only.")
 
-    role_candidates=select_route_role_candidates(
-        expanded,args.route_role_top_per_seed,carry_priority=not args.no_route_carry_priority
-    )
+    role_candidates=select_role_candidates(expanded,args.role_top_per_seed,carry_priority=not args.no_carry_priority)
     role_candidates.to_csv(outdir/"STAGE2_ROLE_CANDIDATES_CARRIED.csv",index=False)
 
-    final_ranked=expanded
-    if not args.skip_route_composition:
-        print(f"[5/7] ROUTE COMPOSITION: exhaustive R1-R10 subsets ({args.route_min_rails}..{args.route_max_rails} rails) ...")
-        print(f"      Carrying {len(role_candidates)} Guardian/Trigger candidates; Guardian/Trigger may remain role-only.")
-        final_ranked=run_route_composition(
-            role_candidates,arrays,daily,inst,eval_start_ns,fwd_start_ns,args.registry_limit,
-            args.route_min_rails,args.route_max_rails
-        )
-        final_ranked.to_csv(outdir/"STAGE2_ROUTE_COMPOSITION_ALL.csv",index=False)
-        final_ranked.head(100).to_csv(outdir/"STAGE2_TOP100_ROUTE_COMPOSITION.csv",index=False)
-        print(final_ranked[["rank","seed","guardian","trigger","route_count","route_slots","guardian_role_only","trigger_role_only","closed_120d","wins_120d","losses_120d","win_rate_120d","closed_30d","net_pips_120d"]].head(25).to_string(index=False))
-    else:
-        print("[5/7] Route composition skipped by request.")
+    print("[5/9] MACRO/MICRO DISCOVERY: every two-rail route pair ...")
+    print(f"      Carrying {len(role_candidates)} G/T candidates. G/T may remain role-only.")
+    macro_micro=run_macro_micro(role_candidates,arrays,daily,inst,eval_start_ns,fwd_start_ns,args.registry_limit)
+    macro_micro.to_csv(outdir/"STAGE2_MACRO_MICRO_ALL.csv",index=False)
+    macro_micro.head(100).to_csv(outdir/"STAGE2_TOP100_MACRO_MICRO.csv",index=False)
+    print(macro_micro[["rank","seed","guardian","trigger","macro","micro","route_slots","closed_120d","wins_120d","losses_120d","win_rate_120d","closed_30d","net_pips_120d"]].head(25).to_string(index=False))
 
-    print("[6/7] Writing pair-profile promotion package ...")
-    best=final_ranked.iloc[0].to_dict()
-    best_seed=SEEDS[str(best["seed"])]
-    route_slots=tuple(x for x in str(best.get("route_slots","")).split(",") if x)
-    if not route_slots:
-        route_slots=tuple(slot for slot in SLOTS if best_seed.rails[slot].route)
+    final_parts=[macro_micro]
+    bridge_all=bridge_earned=macro_micro.head(0)
+    if not args.skip_bridge:
+        bridge_parents=select_route_candidates(macro_micro,args.macro_micro_top_per_seed)
+        bridge_parents.to_csv(outdir/"STAGE3_BRIDGE_PARENTS.csv",index=False)
+        print("[6/9] BRIDGE CHALLENGE: one extra route rail must strictly improve its Macro/Micro parent ...")
+        bridge_all,bridge_earned=run_added_rail_challenge(
+            bridge_parents,arrays,daily,inst,eval_start_ns,fwd_start_ns,args.registry_limit,3
+        )
+        bridge_all.to_csv(outdir/"STAGE3_BRIDGE_ALL.csv",index=False)
+        bridge_earned.to_csv(outdir/"STAGE3_BRIDGE_EARNED.csv",index=False)
+        print(f"      Bridges that earned their place: {len(bridge_earned):,}/{len(bridge_all):,}")
+        if not bridge_earned.empty:
+            print(bridge_earned[["rank","seed","guardian","trigger","macro","micro","bridge_rail","route_slots","delta_closed","delta_net_pips","closed_120d","wins_120d","losses_120d","win_rate_120d","net_pips_120d"]].head(25).to_string(index=False))
+            final_parts.append(bridge_earned)
+    else:
+        print("[6/9] Bridge challenge skipped by request.")
+
+    fourth_all=fourth_earned=macro_micro.head(0)
+    if not args.skip_fourth and not bridge_earned.empty:
+        fourth_parents=select_route_candidates(bridge_earned,args.bridge_top_per_seed)
+        fourth_parents.to_csv(outdir/"STAGE4_FOURTH_PARENTS.csv",index=False)
+        print("[7/9] FOURTH-RAIL CHALLENGE: only earned bridge structures may add one more rail ...")
+        fourth_all,fourth_earned=run_added_rail_challenge(
+            fourth_parents,arrays,daily,inst,eval_start_ns,fwd_start_ns,args.registry_limit,4
+        )
+        fourth_all.to_csv(outdir/"STAGE4_FOURTH_ALL.csv",index=False)
+        fourth_earned.to_csv(outdir/"STAGE4_FOURTH_EARNED.csv",index=False)
+        print(f"      Fourth rails that earned their place: {len(fourth_earned):,}/{len(fourth_all):,}")
+        if not fourth_earned.empty:
+            final_parts.append(fourth_earned)
+    elif args.skip_fourth:
+        print("[7/9] Fourth-rail challenge skipped by request.")
+    else:
+        print("[7/9] No earned bridge structures; fourth rail is not allowed to audition.")
+
+    final_ranked=rank_df(pd.concat(final_parts,ignore_index=True))
+    final_ranked.to_csv(outdir/"FINAL_CANDIDATES.csv",index=False)
+    final_ranked.head(100).to_csv(outdir/"TOP100_FINAL_CANDIDATES.csv",index=False)
+
+    print("[8/9] Writing pair-profile promotion package ...")
+    best=final_ranked.iloc[0].to_dict(); best_seed=SEEDS[str(best["seed"])]
+    route_slots=tuple(x for x in str(best.get("route_slots","" )).split(",") if x)
     role_only_required=sorted(set(x for x in (str(best["guardian"]),str(best["trigger"])) if x not in set(route_slots)))
     promotion={
         "build_id":BUILD_ID,
         "instrument":inst,
         "pair_key":pair_key(inst),
-        "stage":"GUARD_TRIGGER_PLUS_ROUTE_COMPOSITION" if not args.skip_route_composition else "GUARD_TRIGGER_SOURCE_FIRST",
+        "stage":"MACRO_MICRO_WITH_EARNED_EXTRAS",
         "guardian_independent_profile":False,
         "trigger_independent_profile":False,
         "guardian_source":str(best["guardian"]),
         "trigger_source":str(best["trigger"]),
         "same_guard_trigger":bool(best["same_guard_trigger"]),
+        "macro_route":str(best.get("macro","")),
+        "micro_route":str(best.get("micro","")),
+        "bridge_rail":str(best.get("bridge_rail","")),
+        "fourth_rail":str(best.get("fourth_rail","")),
         "route_slots":list(route_slots),
         "route_count":len(route_slots),
         "role_only_enable_required":role_only_required,
         "seed_math_profile":best_seed.name,
         "route_profile":route_profile_manifest(best_seed,route_slots),
+        "minimum_sufficient_structure":True,
+        "extra_rail_rule":"A third/fourth route rail is eligible only when it strictly improves its exact parent on the trading-performance lexicographic key; equal results are rejected as unnecessary complexity.",
         "trade_contract":{
             "target_scope":"Any Route R","after_target_exit":"One Leg Only","entry_qualification":"Delayed Confirmation",
             "historical_turns":args.registry_limit,"clutter":False,"adx_gates":False,"guardian_break":"Guardian Direction Flip"
@@ -846,28 +989,31 @@ def main() -> int:
             for k in ["closed_120d","wins_120d","losses_120d","win_rate_120d","net_pips_120d","max_mae_pips_120d","longest_days_120d","avg_hold_days_120d","closed_30d","wins_30d","losses_30d","net_pips_30d","open_or_pending_end"]
         },
         "sample_quality":str(best["sample_quality"]),
-        "next_stage":"Freeze Guardian/Trigger + route membership, then sweep MA family / length / RAW-ZAG on the active route rails; independent Guardian/Trigger profiles remain later stages.",
+        "next_stage":"Freeze Guardian/Trigger + minimum sufficient Macro/Micro route architecture. Then sweep MA family and length on the retained route rails and role-only rails; RAW/ZAG follows; independent Guardian/Trigger profiles remain later stages.",
         "tradingview_verification_required":True,
     }
     (outdir/"PAIR_PROFILE_PROMOTION.json").write_text(json.dumps(promotion,indent=2))
-    final_ranked.head(50).to_csv(outdir/"TOP50_FINAL_CANDIDATES.csv",index=False)
     (outdir/"SEED_MATH_PROFILES.json").write_text(json.dumps({s.name:seed_manifest(s) for s in selected},indent=2))
     manifest={
         "build_id":BUILD_ID,"instrument":inst,"eval_days":args.eval_days,"forward_days":args.forward_days,
         "registry_limit":args.registry_limit,"seeds":[s.name for s in selected],"expanded_scope":args.expanded_scope,
-        "priority_tests":len(priority),"expanded_tests":len(expanded),"route_role_candidates":len(role_candidates),
-        "route_min_rails":args.route_min_rails,"route_max_rails":args.route_max_rails,
-        "route_subsets_per_role":0 if args.skip_route_composition else len(route_subsets(args.route_min_rails,args.route_max_rails)),
-        "route_joint_tests":0 if args.skip_route_composition else len(final_ranked),"result_dir":str(outdir),
+        "priority_tests":len(priority),"expanded_tests":len(expanded),"role_candidates":len(role_candidates),
+        "macro_micro_pairs_per_role":45,"macro_micro_joint_tests":len(macro_micro),
+        "bridge_tests":len(bridge_all),"bridge_earned":len(bridge_earned),
+        "fourth_tests":len(fourth_all),"fourth_earned":len(fourth_earned),"result_dir":str(outdir),
     }
     (outdir/"RUN_MANIFEST.json").write_text(json.dumps(manifest,indent=2))
 
-    print("[7/7] DONE")
-    print(f"      Winner: {best_seed.name} math | Guardian {best['guardian']} | Trigger {best['trigger']} | routes {','.join(route_slots)} | {int(best['wins_120d'])}/{int(best['closed_120d'])} | {float(best['win_rate_120d']):.2f}%")
+    print("[9/9] DONE")
+    print(f"      Winner: {best_seed.name} math | Guardian {best['guardian']} | Trigger {best['trigger']} | Macro {best.get('macro','')} | Micro {best.get('micro','')} | routes {','.join(route_slots)} | {int(best['wins_120d'])}/{int(best['closed_120d'])} | {float(best['win_rate_120d']):.2f}%")
+    if str(best.get("bridge_rail","")):
+        print(f"      Bridge earned: {best.get('bridge_rail')}")
+    if str(best.get("fourth_rail","")):
+        print(f"      Fourth rail earned: {best.get('fourth_rail')}")
     if role_only_required:
         print("      Role-only R calculation required (route rays OFF): " + ", ".join(role_only_required))
     print(f"      Results: {outdir}")
-    print("      Route membership was swept independently; no pair is forced to keep every seed route rail.")
+    print("      Minimum sufficient structure enforced: extra route rails survive only when they improve the parent result.")
     print("      This pair is NOT required to match AUDUSD 51/51 or EURUSD 47/47. It wins on its own statistics.")
     return 0
 
