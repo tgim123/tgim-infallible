@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-TGIM ROLE-FIRST PAIR SWEEPER v3.0
-=================================
+TGIM ROLE-FIRST + ROUTE-COMPOSITION SWEEPER v3.1
+==================================================
 
-BUILD ID: TGIM-ROLE-FIRST-V3.0.1-20260829
+BUILD ID: TGIM-ROLE-FIRST-V3.1-ROUTECOMP-20260829
 
 Purpose
 -------
@@ -12,26 +12,29 @@ and Trigger Timeframe Source R.  Guardian/Trigger independent MA profiles are
 FORCED OFF in this stage.  The selected role consumes the chosen R bay exactly.
 
 This build deliberately does NOT aim for 51/51 on every instrument.  51/51
-AUDUSD and 47/47 EURUSD are seed/reference profiles only.  Every pair is ranked
-on its own results.
+AUDUSD and 47/47 EURUSD are seed/reference math profiles only.  Every pair is
+ranked on its own results.  Route participation is NOT inherited as a fixed truth:
+a pair may use one route rail, three, four, seven, or all ten if that is what wins.
 
 Default staged run
 ------------------
-1) For each route seed (AUD51 and EUR47), test the four high-priority role pairs:
+1) For each seed MATH family (AUD51 and EUR47), test the four high-priority roles:
        G R1 / T R1
        G R1 / T R2
        G R2 / T R1
        G R2 / T R2
 2) Expand Guardian x Trigger to all R1..R10 (100 combinations per seed).
-   R3/R4/R5 are allowed as ROLE-ONLY sources using their seed math while their
-   route rays remain OFF.  If one wins, the promotion file tells Pine to enable
-   that R for calculation but keep its route rays OFF.
-3) Rank each instrument independently:
+3) Carry the strongest role relationships PER SEED (plus the R1/R2 priority set)
+   into an exhaustive ROUTE-COMPOSITION sweep.  By default every non-empty subset
+   of R1..R10 is tested: 2^10 - 1 = 1,023 possible route-ray populations.
+   Guardian and Trigger do NOT have to be route rails; they can remain role-only.
+4) Rank each instrument independently:
        zero closed losses / 100% first
        then more closed trades
        then net pips
        then lower max MAE
        then shorter average hold
+       then, only as a final tie-breaker, fewer route rails
 
 Fixed trade architecture for this stage
 ---------------------------------------
@@ -75,14 +78,15 @@ EUR47 (EURUSD GT47 seed family):
 Important
 ---------
 This is a research/ranking program.  It cannot place orders.  TradingView Pine
-remains the final promotion verifier.  The Python simulator intentionally keeps
-this stage narrow: role-source discovery first, then later sweep stages mutate
-route families/lengths/RAW-ZAG around the winning role relationship.
+remains the final promotion verifier.  Stage 1 discovers role sources; Stage 2
+removes the fixed-route assumption and searches route membership itself before
+any later MA-family/length/RAW-ZAG mutation.
 """
 
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import math
 import os
@@ -101,7 +105,7 @@ try:
 except Exception as exc:
     raise SystemExit(f"numba is required: {exc}")
 
-BUILD_ID = "TGIM-ROLE-FIRST-V3.0.1-20260829"
+BUILD_ID = "TGIM-ROLE-FIRST-V3.1-ROUTECOMP-20260829"
 SLOTS = tuple(f"R{i}" for i in range(1, 11))
 SLOT_INDEX = {s: i for i, s in enumerate(SLOTS)}
 TF = {
@@ -564,12 +568,17 @@ def _simulate_role_pair(guardian,trigger,evt,ray_price,dirs,commits,route_on,o,h
     return out
 
 
-def metric_row(seed: str, g: str, tr: str, m: np.ndarray, role_only_flags: Dict[str,bool]) -> dict:
+def metric_row(seed: str, g: str, tr: str, m: np.ndarray, role_only_flags: Dict[str,bool], route_slots=None) -> dict:
     closed=int(m[1]); wins=int(m[2]); losses=int(m[3]); closed30=int(m[9]); wins30=int(m[10]); losses30=int(m[11])
     wr=100.0*wins/closed if closed else 0.0
+    if route_slots is None:
+        route_slots=[]
+    route_slots=tuple(route_slots)
+    route_set=set(route_slots)
     return {
         "seed":seed,"guardian":g,"trigger":tr,"same_guard_trigger":g==tr,
-        "guardian_role_only":bool(role_only_flags.get(g,False)),"trigger_role_only":bool(role_only_flags.get(tr,False)),
+        "guardian_role_only":g not in route_set,"trigger_role_only":tr not in route_set,
+        "route_count":len(route_slots),"route_slots":",".join(route_slots),
         "closed_120d":closed,"wins_120d":wins,"losses_120d":losses,"win_rate_120d":wr,
         "net_pips_120d":float(m[4]),"max_mae_pips_120d":float(m[5]),"longest_days_120d":float(m[6]),"avg_hold_days_120d":float(m[7]),
         "closed_30d":closed30,"wins_30d":wins30,"losses_30d":losses30,"net_pips_30d":float(m[12]),"open_or_pending_end":int(m[13]),
@@ -588,17 +597,16 @@ def sample_quality(n: int) -> str:
 def rank_df(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty: return df
     z=df.copy()
-    # rank_df() can be called on frames that were already ranked (for example,
-    # after concatenating per-seed priority results).  Remove the stale rank
-    # before calculating the new combined ordering so pandas never receives a
-    # duplicate "rank" insertion.
     if "rank" in z.columns:
         z=z.drop(columns=["rank"])
     z["perfect"]=(z.losses_120d==0) & (z.closed_120d>0)
-    z=z.sort_values(
-        ["perfect","win_rate_120d","closed_120d","net_pips_120d","max_mae_pips_120d","avg_hold_days_120d","closed_30d"],
-        ascending=[False,False,False,False,True,True,False], kind="mergesort"
-    ).reset_index(drop=True)
+    sort_cols=["perfect","win_rate_120d","closed_120d","net_pips_120d","max_mae_pips_120d","avg_hold_days_120d","closed_30d"]
+    ascending=[False,False,False,False,True,True,False]
+    # Simplicity is deliberately LAST.  A smaller route set never beats a stronger
+    # trading result merely because it is smaller; it only breaks an actual tie.
+    if "route_count" in z.columns:
+        sort_cols.append("route_count"); ascending.append(True)
+    z=z.sort_values(sort_cols,ascending=ascending,kind="mergesort").reset_index(drop=True)
     z.insert(0,"rank",np.arange(1,len(z)+1))
     return z
 
@@ -617,20 +625,81 @@ def seed_manifest(seed: SeedProfile) -> dict:
     return {slot:{"tf":TF_LABEL[slot],**asdict(seed.rails[slot])} for slot in SLOTS}
 
 
+def _route_slots_from_mask(route_on: np.ndarray) -> Tuple[str,...]:
+    return tuple(SLOTS[i] for i in range(10) if bool(route_on[i]))
+
+
+def route_subsets(min_rails: int=1, max_rails: int=10) -> List[Tuple[str,...]]:
+    min_rails=max(1,min_rails); max_rails=min(10,max_rails)
+    if min_rails>max_rails:
+        raise ValueError("route min rails cannot exceed route max rails")
+    # Test 3/4-rail structures early for useful live progress, then the rest.
+    preferred=[3,4,2,5,1,6,7,8,9,10]
+    sizes=[n for n in preferred if min_rails<=n<=max_rails]
+    out=[]
+    for n in sizes:
+        out.extend(itertools.combinations(SLOTS,n))
+    return out
+
+
 def run_seed(seed: SeedProfile, arrays, daily, inst, eval_start_ns, fwd_start_ns, registry_limit, scope: str) -> pd.DataFrame:
     evt,ray_price,dirs,commits,route_on=arrays
     o=daily.open.to_numpy(float); h=daily.high.to_numpy(float); l=daily.low.to_numpy(float); c=daily.close.to_numpy(float)
     ons=daily.bar_open_ns.to_numpy(np.int64); cns=daily.bar_close_ns.to_numpy(np.int64); pip=pip_size(inst)
-    role_only={slot:(not seed.rails[slot].route) for slot in SLOTS}
+    seed_routes=_route_slots_from_mask(route_on)
     rows=[]
     for g,tr in role_pairs(scope,route_on):
         m=_simulate_role_pair(SLOT_INDEX[g],SLOT_INDEX[tr],evt,ray_price,dirs,commits,route_on,o,h,l,c,ons,cns,eval_start_ns,fwd_start_ns,pip,registry_limit)
-        rows.append(metric_row(seed.name,g,tr,m,role_only))
+        rows.append(metric_row(seed.name,g,tr,m,{},seed_routes))
     return rank_df(pd.DataFrame(rows))
 
 
+def select_route_role_candidates(expanded: pd.DataFrame, per_seed: int, carry_priority: bool=True) -> pd.DataFrame:
+    parts=[]
+    for seed_name,grp in expanded.groupby("seed",sort=False):
+        parts.append(rank_df(grp).head(per_seed))
+        if carry_priority:
+            p=grp[grp.guardian.isin(["R1","R2"]) & grp.trigger.isin(["R1","R2"])]
+            if not p.empty: parts.append(p)
+    if not parts:
+        return expanded.head(0)
+    z=pd.concat(parts,ignore_index=True)
+    z=z.drop_duplicates(["seed","guardian","trigger"],keep="first")
+    return rank_df(z)
+
+
+def run_route_composition(role_candidates: pd.DataFrame, arrays_by_seed, daily, inst, eval_start_ns, fwd_start_ns, registry_limit, min_rails: int, max_rails: int) -> pd.DataFrame:
+    o=daily.open.to_numpy(float); h=daily.high.to_numpy(float); l=daily.low.to_numpy(float); c=daily.close.to_numpy(float)
+    ons=daily.bar_open_ns.to_numpy(np.int64); cns=daily.bar_close_ns.to_numpy(np.int64); pip=pip_size(inst)
+    subsets=route_subsets(min_rails,max_rails)
+    rows=[]; total=len(role_candidates)*len(subsets); done=0
+    print(f"      Route subsets per role candidate: {len(subsets):,} | joint tests: {total:,}")
+    for _,cand in role_candidates.iterrows():
+        seed_name=str(cand.seed); g=str(cand.guardian); tr=str(cand.trigger)
+        evt,ray_price,dirs,commits,_seed_route=arrays_by_seed[seed_name]
+        for slots in subsets:
+            route_on=np.zeros(10,np.bool_)
+            for s in slots: route_on[SLOT_INDEX[s]]=True
+            m=_simulate_role_pair(SLOT_INDEX[g],SLOT_INDEX[tr],evt,ray_price,dirs,commits,route_on,o,h,l,c,ons,cns,eval_start_ns,fwd_start_ns,pip,registry_limit)
+            rows.append(metric_row(seed_name,g,tr,m,{},slots))
+            done+=1
+            if done % 1000 == 0 or done==total:
+                print(f"      route composition progress: {done:,}/{total:,}")
+    return rank_df(pd.DataFrame(rows))
+
+
+def route_profile_manifest(seed: SeedProfile, route_slots) -> dict:
+    route_set=set(route_slots)
+    out={}
+    for slot in SLOTS:
+        d={"tf":TF_LABEL[slot],**asdict(seed.rails[slot])}
+        d["route"]=slot in route_set
+        out[slot]=d
+    return out
+
+
 def parse_args():
-    p=argparse.ArgumentParser(description="TGIM role-first Guardian/Trigger source sweeper")
+    p=argparse.ArgumentParser(description="TGIM role-first Guardian/Trigger + exhaustive route-composition sweeper")
     p.add_argument("--instrument",required=False,default="EUR_USD")
     p.add_argument("--token",default=os.getenv("OANDA_TOKEN", ""))
     p.add_argument("--env",choices=["practice","live"],default=os.getenv("OANDA_ENV","practice"))
@@ -641,6 +710,11 @@ def parse_args():
     p.add_argument("--registry-limit",type=int,default=27)
     p.add_argument("--expanded-scope",choices=["active","all10"],default="all10")
     p.add_argument("--skip-expanded",action="store_true")
+    p.add_argument("--skip-route-composition",action="store_true")
+    p.add_argument("--route-role-top-per-seed",type=int,default=10,help="Top expanded G/T relationships per seed carried into route composition")
+    p.add_argument("--route-min-rails",type=int,default=1,help="Minimum number of route-ray R bays to test")
+    p.add_argument("--route-max-rails",type=int,default=10,help="Maximum number of route-ray R bays to test")
+    p.add_argument("--no-route-carry-priority",action="store_true",help="Do not force the four R1/R2 priority role pairs into Stage 2")
     p.add_argument("--refresh",action="store_true")
     p.add_argument("--cache-dir",default="./cache")
     p.add_argument("--result-dir",default="")
@@ -658,7 +732,10 @@ def self_test() -> int:
     x=np.linspace(1.0,1.3,nd); o=x.copy(); h=x+0.01; l=x-0.01; c=x+0.005
     ons=np.arange(nd,dtype=np.int64)*86_400_000_000_000; cns=ons+86_400_000_000_000
     m=_simulate_role_pair(0,0,evt,rp,dirs,cm,route,o,h,l,c,ons,cns,0,ons[-5],0.0001,27)
-    print("SELF TEST OK", m.tolist()); return 0
+    assert len(route_subsets(1,10))==1023
+    test=pd.DataFrame([metric_row("X","R1","R2",m,{},("R1","R2","R3")),metric_row("X","R1","R1",m,{},("R1","R2"))])
+    ranked=rank_df(rank_df(test)); assert list(ranked["rank"])==[1,2]
+    print("SELF TEST OK", m.tolist(), "route_subsets=1023"); return 0
 
 
 def main() -> int:
@@ -669,6 +746,10 @@ def main() -> int:
         raise SystemExit("Require 0 < forward-days <= eval-days")
     if args.registry_limit<3 or args.registry_limit>MAX_REGISTRY:
         raise SystemExit(f"registry-limit must be 3..{MAX_REGISTRY}")
+    if args.route_role_top_per_seed<1:
+        raise SystemExit("route-role-top-per-seed must be >= 1")
+    if not (1<=args.route_min_rails<=10 and 1<=args.route_max_rails<=10 and args.route_min_rails<=args.route_max_rails):
+        raise SystemExit("route rail bounds must satisfy 1 <= min <= max <= 10")
 
     now=datetime.now(timezone.utc)
     start=now-timedelta(days=args.eval_days+args.warmup_days+30)
@@ -676,8 +757,8 @@ def main() -> int:
     cache=Path(args.cache_dir)
     hist=OandaHistory(args.token,args.env,cache)
 
-    print(f"TGIM ROLE-FIRST v3.0 | {inst}")
-    print("[1/6] Fetching fixed R1-R10 timeframe history ...")
+    print(f"TGIM ROLE-FIRST + ROUTE-COMPOSITION v3.1 | {inst}")
+    print("[1/7] Fetching fixed R1-R10 timeframe history ...")
     raw={}
     for gran in sorted(set(TF.values()), key=lambda x:(x!="D",x)):
         raw[gran]=hist.candles(inst,gran,start,end,args.refresh)
@@ -692,76 +773,101 @@ def main() -> int:
     outdir=Path(args.result_dir) if args.result_dir else Path("results")/f"{inst}_{BUILD_ID}"
     outdir.mkdir(parents=True,exist_ok=True)
 
-    print("[2/6] Preparing seed rail/event arrays ...")
+    print("[2/7] Preparing all ten R-bay rail/event arrays for each seed math family ...")
     arrays={s.name:prepare_seed_arrays(raw,daily,s) for s in selected}
 
-    print("[3/6] PRIORITY role sweep: R1/R2 x R1/R2, independent profiles OFF ...")
+    print("[3/7] PRIORITY role sweep: R1/R2 x R1/R2, independent profiles OFF ...")
     pri=[]
     for s in selected:
-        d=run_seed(s,arrays[s.name],daily,inst,eval_start_ns,fwd_start_ns,args.registry_limit,"priority")
-        pri.append(d)
+        pri.append(run_seed(s,arrays[s.name],daily,inst,eval_start_ns,fwd_start_ns,args.registry_limit,"priority"))
     priority=rank_df(pd.concat(pri,ignore_index=True))
     priority.to_csv(outdir/"STAGE1_PRIORITY_R1_R2.csv",index=False)
     print(priority[["rank","seed","guardian","trigger","closed_120d","wins_120d","losses_120d","win_rate_120d","closed_30d","net_pips_120d"]].head(12).to_string(index=False))
 
     expanded=priority
     if not args.skip_expanded:
-        print(f"[4/6] EXPANDED role sweep: {args.expanded_scope} Guardian x Trigger ...")
+        print(f"[4/7] EXPANDED role sweep: {args.expanded_scope} Guardian x Trigger ...")
         allrows=[]
         for s in selected:
-            d=run_seed(s,arrays[s.name],daily,inst,eval_start_ns,fwd_start_ns,args.registry_limit,args.expanded_scope)
-            allrows.append(d)
+            allrows.append(run_seed(s,arrays[s.name],daily,inst,eval_start_ns,fwd_start_ns,args.registry_limit,args.expanded_scope))
         expanded=rank_df(pd.concat(allrows,ignore_index=True))
         expanded.to_csv(outdir/"STAGE1_EXPANDED_GUARD_TRIGGER.csv",index=False)
-        print(expanded[["rank","seed","guardian","trigger","guardian_role_only","trigger_role_only","closed_120d","wins_120d","losses_120d","win_rate_120d","closed_30d","net_pips_120d"]].head(20).to_string(index=False))
+        print(expanded[["rank","seed","guardian","trigger","closed_120d","wins_120d","losses_120d","win_rate_120d","closed_30d","net_pips_120d"]].head(20).to_string(index=False))
     else:
-        print("[4/6] Expanded sweep skipped by request.")
+        print("[4/7] Expanded sweep skipped by request; route composition will use priority roles only.")
 
-    print("[5/6] Writing pair-profile promotion package ...")
-    best=expanded.iloc[0].to_dict()
+    role_candidates=select_route_role_candidates(
+        expanded,args.route_role_top_per_seed,carry_priority=not args.no_route_carry_priority
+    )
+    role_candidates.to_csv(outdir/"STAGE2_ROLE_CANDIDATES_CARRIED.csv",index=False)
+
+    final_ranked=expanded
+    if not args.skip_route_composition:
+        print(f"[5/7] ROUTE COMPOSITION: exhaustive R1-R10 subsets ({args.route_min_rails}..{args.route_max_rails} rails) ...")
+        print(f"      Carrying {len(role_candidates)} Guardian/Trigger candidates; Guardian/Trigger may remain role-only.")
+        final_ranked=run_route_composition(
+            role_candidates,arrays,daily,inst,eval_start_ns,fwd_start_ns,args.registry_limit,
+            args.route_min_rails,args.route_max_rails
+        )
+        final_ranked.to_csv(outdir/"STAGE2_ROUTE_COMPOSITION_ALL.csv",index=False)
+        final_ranked.head(100).to_csv(outdir/"STAGE2_TOP100_ROUTE_COMPOSITION.csv",index=False)
+        print(final_ranked[["rank","seed","guardian","trigger","route_count","route_slots","guardian_role_only","trigger_role_only","closed_120d","wins_120d","losses_120d","win_rate_120d","closed_30d","net_pips_120d"]].head(25).to_string(index=False))
+    else:
+        print("[5/7] Route composition skipped by request.")
+
+    print("[6/7] Writing pair-profile promotion package ...")
+    best=final_ranked.iloc[0].to_dict()
     best_seed=SEEDS[str(best["seed"])]
+    route_slots=tuple(x for x in str(best.get("route_slots","")).split(",") if x)
+    if not route_slots:
+        route_slots=tuple(slot for slot in SLOTS if best_seed.rails[slot].route)
+    role_only_required=sorted(set(x for x in (str(best["guardian"]),str(best["trigger"])) if x not in set(route_slots)))
     promotion={
         "build_id":BUILD_ID,
         "instrument":inst,
         "pair_key":pair_key(inst),
-        "stage":"GUARD_TRIGGER_SOURCE_FIRST",
+        "stage":"GUARD_TRIGGER_PLUS_ROUTE_COMPOSITION" if not args.skip_route_composition else "GUARD_TRIGGER_SOURCE_FIRST",
         "guardian_independent_profile":False,
         "trigger_independent_profile":False,
         "guardian_source":str(best["guardian"]),
         "trigger_source":str(best["trigger"]),
         "same_guard_trigger":bool(best["same_guard_trigger"]),
-        "role_only_enable_required":sorted(set([
-            x for x,flag in ((str(best["guardian"]),bool(best["guardian_role_only"])),(str(best["trigger"]),bool(best["trigger_role_only"]))) if flag
-        ])),
-        "seed_route_profile":best_seed.name,
-        "route_profile":seed_manifest(best_seed),
+        "route_slots":list(route_slots),
+        "route_count":len(route_slots),
+        "role_only_enable_required":role_only_required,
+        "seed_math_profile":best_seed.name,
+        "route_profile":route_profile_manifest(best_seed,route_slots),
         "trade_contract":{
             "target_scope":"Any Route R","after_target_exit":"One Leg Only","entry_qualification":"Delayed Confirmation",
             "historical_turns":args.registry_limit,"clutter":False,"adx_gates":False,"guardian_break":"Guardian Direction Flip"
         },
         "metrics":{
-            k:(int(best[k]) if k.startswith(("closed","wins","losses","open")) else float(best[k]))
+            k:(int(best[k]) if k.startswith(("closed","wins","losses","open","route_count")) else float(best[k]))
             for k in ["closed_120d","wins_120d","losses_120d","win_rate_120d","net_pips_120d","max_mae_pips_120d","longest_days_120d","avg_hold_days_120d","closed_30d","wins_30d","losses_30d","net_pips_30d","open_or_pending_end"]
         },
         "sample_quality":str(best["sample_quality"]),
-        "next_stage":"Freeze winning Guardian/Trigger relationship, then sweep active route bays / MA family / length / RAW-ZAG around this pair-specific winner.",
+        "next_stage":"Freeze Guardian/Trigger + route membership, then sweep MA family / length / RAW-ZAG on the active route rails; independent Guardian/Trigger profiles remain later stages.",
         "tradingview_verification_required":True,
     }
     (outdir/"PAIR_PROFILE_PROMOTION.json").write_text(json.dumps(promotion,indent=2))
-    expanded.head(50).to_csv(outdir/"TOP50_ROLE_SOURCE_CANDIDATES.csv",index=False)
-    (outdir/"SEED_PROFILES.json").write_text(json.dumps({s.name:seed_manifest(s) for s in selected},indent=2))
+    final_ranked.head(50).to_csv(outdir/"TOP50_FINAL_CANDIDATES.csv",index=False)
+    (outdir/"SEED_MATH_PROFILES.json").write_text(json.dumps({s.name:seed_manifest(s) for s in selected},indent=2))
     manifest={
         "build_id":BUILD_ID,"instrument":inst,"eval_days":args.eval_days,"forward_days":args.forward_days,
         "registry_limit":args.registry_limit,"seeds":[s.name for s in selected],"expanded_scope":args.expanded_scope,
-        "priority_tests":len(priority),"expanded_tests":len(expanded),"result_dir":str(outdir),
+        "priority_tests":len(priority),"expanded_tests":len(expanded),"route_role_candidates":len(role_candidates),
+        "route_min_rails":args.route_min_rails,"route_max_rails":args.route_max_rails,
+        "route_subsets_per_role":0 if args.skip_route_composition else len(route_subsets(args.route_min_rails,args.route_max_rails)),
+        "route_joint_tests":0 if args.skip_route_composition else len(final_ranked),"result_dir":str(outdir),
     }
     (outdir/"RUN_MANIFEST.json").write_text(json.dumps(manifest,indent=2))
 
-    print("[6/6] DONE")
-    print(f"      Winner: {best_seed.name} | Guardian {best['guardian']} | Trigger {best['trigger']} | {int(best['wins_120d'])}/{int(best['closed_120d'])} | {float(best['win_rate_120d']):.2f}%")
-    if promotion["role_only_enable_required"]:
-        print("      Role-only R enable required (route rays remain OFF): " + ", ".join(promotion["role_only_enable_required"]))
+    print("[7/7] DONE")
+    print(f"      Winner: {best_seed.name} math | Guardian {best['guardian']} | Trigger {best['trigger']} | routes {','.join(route_slots)} | {int(best['wins_120d'])}/{int(best['closed_120d'])} | {float(best['win_rate_120d']):.2f}%")
+    if role_only_required:
+        print("      Role-only R calculation required (route rays OFF): " + ", ".join(role_only_required))
     print(f"      Results: {outdir}")
+    print("      Route membership was swept independently; no pair is forced to keep every seed route rail.")
     print("      This pair is NOT required to match AUDUSD 51/51 or EURUSD 47/47. It wins on its own statistics.")
     return 0
 
