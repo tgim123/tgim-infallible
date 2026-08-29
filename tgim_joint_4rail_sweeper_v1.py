@@ -3,7 +3,7 @@
 TGIM ROLE-FIRST PAIR SWEEPER v3.0
 =================================
 
-BUILD ID: TGIM-ROLE-FIRST-V3.0-20260829
+BUILD ID: TGIM-ROLE-FIRST-V3.0.1-20260829
 
 Purpose
 -------
@@ -101,7 +101,7 @@ try:
 except Exception as exc:
     raise SystemExit(f"numba is required: {exc}")
 
-BUILD_ID = "TGIM-ROLE-FIRST-V3.0-20260829"
+BUILD_ID = "TGIM-ROLE-FIRST-V3.0.1-20260829"
 SLOTS = tuple(f"R{i}" for i in range(1, 11))
 SLOT_INDEX = {s: i for i, s in enumerate(SLOTS)}
 TF = {
@@ -588,6 +588,12 @@ def sample_quality(n: int) -> str:
 def rank_df(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty: return df
     z=df.copy()
+    # rank_df() can be called on frames that were already ranked (for example,
+    # after concatenating per-seed priority results).  Remove the stale rank
+    # before calculating the new combined ordering so pandas never receives a
+    # duplicate "rank" insertion.
+    if "rank" in z.columns:
+        z=z.drop(columns=["rank"])
     z["perfect"]=(z.losses_120d==0) & (z.closed_120d>0)
     z=z.sort_values(
         ["perfect","win_rate_120d","closed_120d","net_pips_120d","max_mae_pips_120d","avg_hold_days_120d","closed_30d"],
