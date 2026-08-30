@@ -1,1021 +1,445 @@
 #!/usr/bin/env python3
 """
-TGIM MACRO/MICRO PAIR SWEEPER v3.2
-================================
+TGIM MACRO/MICRO 45-PAIR BATCH RUNNER v3.2
+=========================================
 
-BUILD ID: TGIM-MACRO-MICRO-V3.2-20260829
+Runs the existing TGIM Macro/Micro Sweeper v3.2 sequentially across the
+remaining OANDA FX universe, saving one isolated result folder per pair plus a
+batch-wide champion leaderboard and promotion bank.
 
-Purpose
--------
-TGIM does not need every available R bay.  The route architecture is treated as
-MACRO + MICRO first: find the smallest two-rail structure that best captures the
-pair's large-scale direction and small-scale travel/checkpoints.
+Default behavior
+----------------
+- Skips EUR_USD and AUD_USD because they are existing manual/reference controls.
+- Runs the remaining 45 pairs in leverage-tier order (50:1 -> 33.3:1 -> 20:1).
+- Continues to the next pair if one instrument fails.
+- Reuses the shared candle cache during the same Render run.
+- Creates a separate stdout log and result directory for every pair.
+- Reads each pair's PAIR_PROFILE_PROMOTION.json when finished.
+- Writes batch progress after every pair so the run is auditable while active.
+- Supports --pairs for a custom subset and --start-at for manual resume.
 
-Guardian and Trigger are still discovered independently first, with both
-independent MA profiles FORCED OFF.  Guardian/Trigger may be route rails or may
-remain calculation-only role rails.
-
-Extra route rails must EARN their place.  After the best Macro/Micro structures
-are found, one optional bridge rail is tested.  A bridge is carried forward only
-when it strictly improves the trading result.  A fourth rail is tested only from
-bridge structures that already improved on their two-rail parent.  Equal results
-do not justify extra complexity.
-
-This build deliberately does NOT aim for 51/51 on every instrument.  AUDUSD
-51/51 and EURUSD 47/47 remain seed/reference math families only.  Every pair
-competes against itself.
-
-Default staged run
-------------------
-1) Priority Guardian/Trigger source sweep:
-       G R1 / T R1
-       G R1 / T R2
-       G R2 / T R1
-       G R2 / T R2
-2) Expand Guardian x Trigger to all R1..R10.
-3) Carry the strongest role relationships per seed into an exhaustive
-   MACRO/MICRO route-pair sweep: C(10,2) = 45 two-rail structures.
-   Because R1..R10 are ordered slow -> fast, the slower selected R is labeled
-   Macro and the faster selected R is labeled Micro.
-4) Carry the strongest Macro/Micro structures into a BRIDGE challenge.  Test each
-   remaining R as a third route rail, but keep it only if the child strictly
-   improves on its exact two-rail parent.
-5) Only from bridge structures that earned their place, challenge one FOURTH rail.
-   Again, it survives only if it strictly improves on its three-rail parent.
-6) Final ranking:
-       zero closed losses / 100% first
-       then more closed trades
-       then net pips
-       then lower max MAE
-       then shorter average hold
-       then more recent opportunities
-       then, only as a final tie-breaker, fewer route rails
-
-Fixed trade architecture for this stage
----------------------------------------
-- Same TGIM pivot-ray -> previous-ray trade logic
-- Any Route R
-- One Leg Only
-- Delayed Confirmation
-- Historical turn registry 27 by default
-- Clutter averaging OFF
-- Per-R ADX gates OFF
-- Guardian Break Definition = Guardian Direction Flip
-- Guardian independent profile OFF
-- Trigger independent profile OFF
-
-Seed math profiles
-------------------
-AUD51 (current AUDUSD 51/51 manual champion math family; listed route flags are seed history only):
-    R1  1W   EMA2  RAW   route ON
-    R2  1D   KS2   RAW   route ON
-    R3  12H  HMA28 RAW   route OFF
-    R4  8H   WMA9  RAW   route OFF
-    R5  6H   KS27  RAW   route OFF
-    R6  4H   HMA27 ZAG   route ON
-    R7  1H   KS27  RAW   route ON
-    R8  15m  KS27  RAW   route ON
-    R9  5m   KS27  RAW   route ON
-    R10 1m   KS2   RAW   route ON
-
-EUR47 (EURUSD GT47 seed math family; listed route flags are seed history only):
-    R1  1W   WMA2  RAW   route ON
-    R2  1D   WMA2  RAW   route ON
-    R3  12H  HMA28 RAW   route OFF
-    R4  8H   WMA9  RAW   route OFF
-    R5  6H   KS27  RAW   route OFF
-    R6  4H   WMA2  RAW   route ON
-    R7  1H   KS27  RAW   route ON
-    R8  15m  KS28  RAW   route ON
-    R9  5m   KS27  RAW   route ON
-    R10 1m   KS5   RAW   route ON
-
-Important
----------
-This is a research/ranking program.  It cannot place orders.  TradingView Pine
-remains the final promotion verifier.  The seed route flags above are NOT treated
-as required route membership in Macro/Micro discovery.  The default run carries
-all 100 Guardian/Trigger relationships per seed into all 45 two-rail route pairs,
-then lets only statistically useful extra rails survive.
+This runner does not change the trading logic.  It orchestrates the existing
+v3.2 pair sweeper exactly once per requested instrument.
 """
 
 from __future__ import annotations
 
 import argparse
-import itertools
+import csv
 import json
-import math
 import os
+import subprocess
+import sys
 import time
-from dataclasses import dataclass, asdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-import numpy as np
-import pandas as pd
-import requests
+BATCH_BUILD_ID = "TGIM-MACRO-MICRO-BATCH-V3.2-20260830"
+EXPECTED_SWEEPER_BUILD = "TGIM-MACRO-MICRO-V3.2-20260829"
 
-try:
-    from numba import njit
-except Exception as exc:
-    raise SystemExit(f"numba is required: {exc}")
+# User's OANDA research universe. EUR_USD and AUD_USD are intentionally omitted
+# from DEFAULT_45 because they are existing reference/manual champions.
+TIER_50 = [
+    "EUR_USD", "USD_CAD", "EUR_CAD", "USD_DKK",
+]
 
-BUILD_ID = "TGIM-MACRO-MICRO-V3.2-20260829"
-SLOTS = tuple(f"R{i}" for i in range(1, 11))
-SLOT_INDEX = {s: i for i, s in enumerate(SLOTS)}
-TF = {
-    "R1": "W", "R2": "D", "R3": "H12", "R4": "H8", "R5": "H6",
-    "R6": "H4", "R7": "H1", "R8": "M15", "R9": "M5", "R10": "M1",
-}
-TF_LABEL = {
-    "R1":"1W","R2":"1D","R3":"12H","R4":"8H","R5":"6H",
-    "R6":"4H","R7":"1H","R8":"15m","R9":"5m","R10":"1m",
-}
-MAX_REGISTRY = 128
+TIER_33 = [
+    "AUD_CHF", "AUD_USD", "EUR_NZD", "NZD_USD", "EUR_CHF", "NZD_CAD",
+    "AUD_CAD", "NZD_CHF", "USD_SEK", "EUR_AUD", "USD_CHF", "AUD_NZD",
+    "CAD_CHF", "EUR_SEK",
+]
 
+TIER_20 = [
+    "SGD_JPY", "EUR_GBP", "USD_HUF", "GBP_CHF", "USD_THB", "CAD_JPY",
+    "USD_CNH", "USD_PLN", "GBP_AUD", "AUD_JPY", "EUR_PLN", "EUR_HUF",
+    "USD_JPY", "GBP_NZD", "GBP_CAD", "AUD_SGD", "GBP_JPY", "GBP_USD",
+    "USD_CZK", "EUR_CZK", "GBP_PLN", "GBP_SGD", "EUR_SGD", "EUR_JPY",
+    "CAD_SGD", "NZD_JPY", "CHF_JPY", "NZD_SGD", "USD_SGD",
+]
 
-@dataclass(frozen=True)
-class RSpec:
-    family: str
-    length: int
-    working: str = "RAW"
-    route: bool = False
+REFERENCE_PAIRS = {"EUR_USD", "AUD_USD"}
+DEFAULT_45 = [p for p in (TIER_50 + TIER_33 + TIER_20) if p not in REFERENCE_PAIRS]
 
-
-@dataclass(frozen=True)
-class SeedProfile:
-    name: str
-    rails: Dict[str, RSpec]
+TIER_BY_PAIR = {p: "50:1" for p in TIER_50}
+TIER_BY_PAIR.update({p: "33.3:1" for p in TIER_33})
+TIER_BY_PAIR.update({p: "20:1" for p in TIER_20})
 
 
-AUD51 = SeedProfile("AUD51", {
-    "R1": RSpec("EMA",2,"RAW",True),
-    "R2": RSpec("KS",2,"RAW",True),
-    "R3": RSpec("HMA",28,"RAW",False),
-    "R4": RSpec("WMA",9,"RAW",False),
-    "R5": RSpec("KS",27,"RAW",False),
-    "R6": RSpec("HMA",27,"ZAG",True),
-    "R7": RSpec("KS",27,"RAW",True),
-    "R8": RSpec("KS",27,"RAW",True),
-    "R9": RSpec("KS",27,"RAW",True),
-    "R10": RSpec("KS",2,"RAW",True),
-})
-
-EUR47 = SeedProfile("EUR47", {
-    "R1": RSpec("WMA",2,"RAW",True),
-    "R2": RSpec("WMA",2,"RAW",True),
-    "R3": RSpec("HMA",28,"RAW",False),
-    "R4": RSpec("WMA",9,"RAW",False),
-    "R5": RSpec("KS",27,"RAW",False),
-    "R6": RSpec("WMA",2,"RAW",True),
-    "R7": RSpec("KS",27,"RAW",True),
-    "R8": RSpec("KS",28,"RAW",True),
-    "R9": RSpec("KS",27,"RAW",True),
-    "R10": RSpec("KS",5,"RAW",True),
-})
-
-SEEDS = {"AUD51": AUD51, "EUR47": EUR47}
-
-
-def instrument_norm(raw: str) -> str:
-    s = raw.upper().replace("OANDA:", "").replace("/", "_").replace("-", "_")
+def norm_pair(raw: str) -> str:
+    s = raw.strip().upper().replace("OANDA:", "").replace("/", "_").replace("-", "_")
     if "_" not in s and len(s) == 6:
         s = s[:3] + "_" + s[3:]
     if len(s) != 7 or s[3] != "_":
-        raise ValueError(f"Bad instrument: {raw!r}")
+        raise argparse.ArgumentTypeError(f"Bad pair: {raw!r}")
     return s
 
 
-def pair_key(inst: str) -> str:
-    return inst.replace("_", "")
-
-
-def pip_size(inst: str) -> float:
-    return 0.01 if inst.endswith("_JPY") else 0.0001
-
-
-class OandaHistory:
-    def __init__(self, token: str, env: str, cache_dir: Path, timeout: float = 20.0):
-        if not token:
-            raise ValueError("OANDA_TOKEN is empty. Set it or pass --token.")
-        self.base = "https://api-fxpractice.oanda.com" if env == "practice" else "https://api-fxtrade.oanda.com"
-        self.timeout = timeout
-        self.cache_dir = cache_dir
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.s = requests.Session()
-        self.s.headers.update({"Authorization": f"Bearer {token}", "Accept-Datetime-Format": "RFC3339"})
-
-    def _request(self, path: str, params: dict) -> dict:
-        last = None
-        for attempt in range(6):
-            try:
-                r = self.s.get(self.base + path, params=params, timeout=self.timeout)
-                if r.status_code == 429:
-                    time.sleep(min(8.0, 0.75 * (2 ** attempt)))
-                    continue
-                if r.status_code >= 400:
-                    raise RuntimeError(f"OANDA HTTP {r.status_code}: {(r.text or '')[:800]} | {r.url}")
-                return r.json()
-            except Exception as exc:
-                last = exc
-                time.sleep(min(5.0, 0.5 * (2 ** attempt)))
-        raise RuntimeError(f"OANDA request failed: {last}")
-
-    def candles(self, instrument: str, granularity: str, start: datetime, end: datetime, refresh: bool=False) -> pd.DataFrame:
-        key = f"{instrument}_{granularity}_{start:%Y%m%d}_{end:%Y%m%d}.csv.gz"
-        fp = self.cache_dir / key
-        if fp.exists() and not refresh:
-            df = pd.read_csv(fp, compression="gzip")
-            df["time"] = pd.to_datetime(df["time"], utc=True)
-            return df
-
-        dur_sec = {"M1":60,"M5":300,"M15":900,"H1":3600,"H4":14400,"H6":21600,"H8":28800,"H12":43200,"D":86400,"W":604800}
-        rows = []
-        cursor = start.astimezone(timezone.utc)
-        end = end.astimezone(timezone.utc)
-        path = f"/v3/instruments/{instrument}/candles"
-        while cursor < end:
-            params = {
-                "price":"M","granularity":granularity,
-                "from":cursor.isoformat().replace("+00:00","Z"),
-                "count":5000,"includeFirst":"true","smooth":"false",
-            }
-            if granularity == "D":
-                params.update({"dailyAlignment":17,"alignmentTimezone":"America/New_York"})
-            elif granularity == "W":
-                params.update({"weeklyAlignment":"Friday","alignmentTimezone":"America/New_York"})
-            data = self._request(path, params)
-            cs = data.get("candles", [])
-            if not cs:
-                break
-            last_time = None
-            for c in cs:
-                t = pd.Timestamp(c["time"])
-                t = t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC")
-                if t.to_pydatetime() > end:
-                    continue
-                m = c.get("mid") or {}
-                rows.append({
-                    "time":t,"open":float(m.get("o","nan")),"high":float(m.get("h","nan")),
-                    "low":float(m.get("l","nan")),"close":float(m.get("c","nan")),
-                    "volume":int(c.get("volume",0) or 0),"complete":bool(c.get("complete",False)),
-                })
-                last_time = t
-            if last_time is None:
-                break
-            nxt = last_time.to_pydatetime() + timedelta(seconds=dur_sec[granularity])
-            if nxt <= cursor:
-                break
-            cursor = nxt
-            if len(cs) < 5000:
-                break
-        if not rows:
-            raise RuntimeError(f"No {granularity} candles returned for {instrument}")
-        df = pd.DataFrame(rows).drop_duplicates("time", keep="last").sort_values("time").reset_index(drop=True)
-        df.to_csv(fp, index=False, compression="gzip")
-        return df
-
-
-# ── Pine rail math ───────────────────────────────────────────────────────────
-def ema_np(x: np.ndarray, n: int) -> np.ndarray:
-    out = np.full(len(x), np.nan, dtype=np.float64)
-    a = 2.0/(n+1.0)
-    seed = np.nan
-    for i,v in enumerate(x):
-        if not np.isfinite(v):
+def parse_pairs(text: str) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for item in text.split(","):
+        item = item.strip()
+        if not item:
             continue
-        seed = v if not np.isfinite(seed) else a*v + (1-a)*seed
-        out[i] = seed
+        p = norm_pair(item)
+        if p not in seen:
+            out.append(p)
+            seen.add(p)
     return out
 
 
-def wma_np(x: np.ndarray, n: int) -> np.ndarray:
-    out = np.full(len(x), np.nan, dtype=np.float64)
-    if n <= 0: return out
-    w = np.arange(1.0, n+1.0); den = w.sum()
-    for i in range(n-1, len(x)):
-        y = x[i-n+1:i+1]
-        if np.all(np.isfinite(y)): out[i] = np.dot(y,w)/den
-    return out
-
-
-def linreg_np(x: np.ndarray, n: int) -> np.ndarray:
-    out = np.full(len(x), np.nan, dtype=np.float64)
-    if n <= 1:
-        out[:] = x; return out
-    xs = np.arange(n,dtype=np.float64); sx=xs.sum(); sxx=np.dot(xs,xs); den=n*sxx-sx*sx
-    for i in range(n-1,len(x)):
-        y=x[i-n+1:i+1]
-        if not np.all(np.isfinite(y)): continue
-        sy=y.sum(); sxy=np.dot(xs,y); slope=(n*sxy-sx*sy)/den; intercept=(sy-slope*sx)/n
-        out[i]=intercept+slope*(n-1)
-    return out
-
-
-def hma_np(x: np.ndarray, n: int) -> np.ndarray:
-    half=max(1,int(math.floor(n/2.0+0.5))); root=max(1,int(math.floor(math.sqrt(n)+0.5)))
-    return wma_np(2.0*wma_np(x,half)-wma_np(x,n), root)
-
-
-def rail_np(x: np.ndarray, family: str, n: int) -> np.ndarray:
-    if family=="EMA": return ema_np(x,n)
-    if family=="WMA": return wma_np(x,n)
-    if family=="KS": return linreg_np(x,n)
-    if family=="HMA": return hma_np(x,n)
-    raise ValueError(family)
-
-
-def daily_execution_frame(d: pd.DataFrame) -> pd.DataFrame:
-    d=d.sort_values("time").reset_index(drop=True).copy(); d["next_time"]=d["time"].shift(-1)
-    d=d.loc[d["complete"].astype(bool) & d["next_time"].notna()].copy().reset_index(drop=True)
-    d["bar_open_ns"]=d["time"].astype("int64"); d["bar_close_ns"]=d["next_time"].astype("int64")
-    return d
-
-
-def _daily_ticks(daily: pd.DataFrame) -> np.ndarray:
-    o=daily.open.to_numpy(float); h=daily.high.to_numpy(float); l=daily.low.to_numpy(float); c=daily.close.to_numpy(float)
-    out=np.empty((len(daily),4),dtype=np.float64)
-    for t in range(len(daily)):
-        out[t,0]=o[t]
-        if abs(o[t]-h[t]) <= abs(o[t]-l[t]): out[t,1],out[t,2]=h[t],l[t]
-        else: out[t,1],out[t,2]=l[t],h[t]
-        out[t,3]=c[t]
-    return out
-
-
-def _wma_last_override(close,t,px,n):
-    if t<n-1: return np.nan
-    vals=np.empty(n); vals[:-1]=close[t-n+1:t] if n>1 else []; vals[-1]=px
-    if not np.all(np.isfinite(vals)): return np.nan
-    w=np.arange(1.0,n+1.0); return float(np.dot(vals,w)/w.sum())
-
-
-def _linreg_last_override(close,t,px,n):
-    if n<=1: return float(px)
-    if t<n-1: return np.nan
-    y=np.empty(n); y[:-1]=close[t-n+1:t]; y[-1]=px
-    if not np.all(np.isfinite(y)): return np.nan
-    xs=np.arange(n,dtype=float); sx=xs.sum(); sxx=np.dot(xs,xs); den=n*sxx-sx*sx
-    sy=y.sum(); sxy=np.dot(xs,y); slope=(n*sxy-sx*sy)/den; intercept=(sy-slope*sx)/n
-    return float(intercept+slope*(n-1))
-
-
-def _daily_tick_rail(close, final_rail, raw_hma, spec: RSpec, t, px):
-    n=spec.length
-    if spec.family=="EMA":
-        if t==0 or not np.isfinite(final_rail[t-1]): return float(px)
-        a=2.0/(n+1.0); return float(a*px+(1-a)*final_rail[t-1])
-    if spec.family=="WMA": return _wma_last_override(close,t,px,n)
-    if spec.family=="KS": return _linreg_last_override(close,t,px,n)
-    half=max(1,int(math.floor(n/2.0+0.5))); root=max(1,int(math.floor(math.sqrt(n)+0.5)))
-    a=_wma_last_override(close,t,px,half); b=_wma_last_override(close,t,px,n)
-    if not np.isfinite(a) or not np.isfinite(b): return np.nan
-    raw=2*a-b
-    if root==1: return float(raw)
-    if raw_hma is None or t<root-1: return np.nan
-    vals=np.empty(root); vals[:-1]=raw_hma[t-root+1:t]; vals[-1]=raw
-    if not np.all(np.isfinite(vals)): return np.nan
-    w=np.arange(1.0,root+1.0); return float(np.dot(vals,w)/w.sum())
-
-
-def daily_slot_arrays(daily: pd.DataFrame, spec: RSpec):
-    close=daily.close.to_numpy(float); ticks=_daily_ticks(daily); nd=len(daily)
-    evt=np.zeros((nd,4),np.int8); price=np.full((nd,4),np.nan); direction=np.zeros((nd,4),np.int8)
-    final=rail_np(close,spec.family,spec.length); raw_hma=None
-    if spec.family=="HMA":
-        half=max(1,int(math.floor(spec.length/2.0+0.5)))
-        raw_hma=2*wma_np(close,half)-wma_np(close,spec.length)
-    last_meaningful=0
-    for t in range(1,nd):
-        prev=final[t-1]; prevprev=final[t-2] if t>=2 else np.nan
-        if not np.isfinite(prev): continue
-        for q in range(4):
-            cur=_daily_tick_rail(close,final,raw_hma,spec,t,ticks[t,q])
-            if not np.isfinite(cur): continue
-            d=1 if cur>prev else -1 if cur<prev else 0
-            if d!=0: last_meaningful=d
-            # ZAG direction is the current raw last meaningful direction in this Pine architecture.
-            direction[t,q]=last_meaningful if spec.working=="ZAG" else d
-            price[t,q]=prev
-            if t>=2 and np.isfinite(prevprev):
-                if cur>prev and prev<=prevprev: evt[t,q]=1
-                elif cur<prev and prev>=prevprev: evt[t,q]=-1
-    commit=np.zeros((nd,4),np.bool_); commit[:,0]=True
-    return evt,price,direction,commit
-
-
-def sample_static_to_daily(source: pd.DataFrame, rail: np.ndarray, daily: pd.DataFrame, granularity: str):
-    nd=len(daily); cur=np.full(nd,np.nan); inv=np.full(nd,np.nan); idx=np.full(nd,-1,np.int32)
-    src=source.sort_values("time").reset_index(drop=True); st=pd.to_datetime(src.time,utc=True).astype("int64").to_numpy()
-    complete=src.complete.astype(bool).to_numpy()
-    if granularity=="W":
-        next_start=np.full(len(st),np.iinfo(np.int64).max,dtype=np.int64)
-        if len(st)>1: next_start[:-1]=st[1:]
-        valid=np.flatnonzero(complete & (next_start!=np.iinfo(np.int64).max)); closes=next_start[valid]
-    else:
-        dur={"H1":3600,"H4":14400,"H6":21600,"H8":28800,"H12":43200,"M15":900,"M5":300,"M1":60}[granularity]*1_000_000_000
-        valid=np.flatnonzero(complete); closes=st[valid]+dur
-    for j in range(nd):
-        boundary=int(daily.loc[j,"bar_close_ns"]); pos=np.searchsorted(closes,boundary,side="right")-1
-        if pos>=0:
-            k=int(valid[pos]); idx[j]=k; cur[j]=rail[k]; inv[j]=rail[k-1] if k>0 else np.nan
-    return cur,inv,idx
-
-
-def static_slot_arrays(source: pd.DataFrame, daily: pd.DataFrame, granularity: str, spec: RSpec):
-    close=source.close.to_numpy(float); r=rail_np(close,spec.family,spec.length)
-    cur,inv,idx=sample_static_to_daily(source,r,daily,granularity); nd=len(daily)
-    evt=np.zeros((nd,4),np.int8); price=np.full((nd,4),np.nan); rawdir=np.zeros((nd,4),np.int8)
-    last_meaningful=0
-    for t in range(nd):
-        prev_cur=cur[t-1] if t>=1 else np.nan; prev_inv=inv[t-1] if t>=1 else np.nan
-        for q in range(4):
-            if granularity=="W" and t>=1 and idx[t]!=idx[t-1] and q<3:
-                tc,ti=cur[t-1],inv[t-1]
-            else:
-                tc,ti=cur[t],inv[t]
-            if not (np.isfinite(tc) and np.isfinite(ti)): continue
-            d=1 if tc>ti else -1 if tc<ti else 0
-            if d!=0: last_meaningful=d
-            rawdir[t,q]=last_meaningful if spec.working=="ZAG" else d
-            price[t,q]=ti
-            if t>=1 and np.isfinite(prev_cur) and np.isfinite(prev_inv):
-                if tc>ti and prev_cur<=prev_inv: evt[t,q]=1
-                elif tc<ti and prev_cur>=prev_inv: evt[t,q]=-1
-    commit=np.zeros((nd,4),np.bool_)
-    if granularity=="W":
-        for t in range(1,nd):
-            if idx[t]>=0 and idx[t]!=idx[t-1]: commit[t,0]=True
-    else:
-        commit[:,0]=True
-    return evt,price,rawdir,commit
-
-
-def prepare_seed_arrays(raw: Dict[str,pd.DataFrame], daily: pd.DataFrame, seed: SeedProfile):
-    nd=len(daily)
-    evt=np.zeros((10,nd,4),np.int8); price=np.full((10,nd,4),np.nan); dirs=np.zeros((10,nd,4),np.int8); commits=np.zeros((10,nd,4),np.bool_)
-    route=np.zeros(10,np.bool_)
-    for si,slot in enumerate(SLOTS):
-        spec=seed.rails[slot]; route[si]=spec.route
-        if TF[slot]=="D": e,p,d,cm=daily_slot_arrays(daily,spec)
-        else: e,p,d,cm=static_slot_arrays(raw[TF[slot]],daily,TF[slot],spec)
-        evt[si]=e; price[si]=p; dirs[si]=d; commits[si]=cm
-    return evt,price,dirs,commits,route
-
-
-# ── TGIM one-leg delayed-confirmation simulator ──────────────────────────────
-@njit(cache=True)
-def _tv_path(o,h,l,c):
-    z=np.empty(4,np.float64); z[0]=o
-    if abs(o-h)<=abs(o-l): z[1],z[2]=h,l
-    else: z[1],z[2]=l,h
-    z[3]=c; return z
-
-
-@njit(cache=True)
-def _store_turn(reg_price,reg_type,reg_bar,reg_source,count,price,typ,bar,source,limit):
-    for k in range(count-1,-1,-1):
-        if reg_source[k]==source and reg_bar[k]==bar:
-            reg_price[k]=price; reg_type[k]=typ; return count
-    if count<limit:
-        reg_price[count]=price; reg_type[count]=typ; reg_bar[count]=bar; reg_source[count]=source; return count+1
-    for k in range(limit-1):
-        reg_price[k]=reg_price[k+1]; reg_type[k]=reg_type[k+1]; reg_bar[k]=reg_bar[k+1]; reg_source[k]=reg_source[k+1]
-    reg_price[limit-1]=price; reg_type[limit-1]=typ; reg_bar[limit-1]=bar; reg_source[limit-1]=source
-    return limit
-
-
-@njit(cache=True)
-def _find_target(reg_price,reg_type,reg_bar,reg_source,count,wanted_type,current_bar,route_on):
-    for k in range(count-1,-1,-1):
-        s=reg_source[k]
-        if route_on[s] and reg_bar[k] < current_bar and reg_type[k]==wanted_type:
-            return reg_price[k]
-    return np.nan
-
-
-@njit(cache=True)
-def _simulate_role_pair(guardian,trigger,evt,ray_price,dirs,commits,route_on,o,h,l,c,open_ns,close_ns,eval_start_ns,fwd_start_ns,pip,registry_limit):
-    nd=len(c); day_ns=86_400_000_000_000
-    reg_price=np.empty(MAX_REGISTRY,np.float64); reg_type=np.empty(MAX_REGISTRY,np.int8); reg_bar=np.empty(MAX_REGISTRY,np.int32); reg_source=np.empty(MAX_REGISTRY,np.int8); reg_count=0
-    position=0; entry_price=0.0; target=np.nan; entry_ns=0; mae=0.0
-    order_pending=0; order_target=np.nan; signal_day=-1; signal_tick=-1
-    guard_last=0; guard_committed=0; exit_day=-1
-    armed=False; armed_dir=0; armed_source=0; armed_type=0; armed_target=np.nan
-    entries=closed=wins=0; entries30=closed30=wins30=0; net=net30=0.0; max_mae=0.0; longest=0.0; hold_sum=0.0
-
-    for t in range(nd):
-        ticks=_tv_path(o[t],h[t],l[t],c[t]); span=close_ns[t]-open_ns[t]
-        if span<=0: span=day_ns
-        for q in range(4):
-            px=ticks[q]; tick_ns=open_ns[t]+(span*q)//3
-            gd=int(dirs[guardian,t,q]); td=int(dirs[trigger,t,q])
-            if gd!=0: guard_last=gd
-            if commits[guardian,t,q] and gd!=0: guard_committed=gd
-
-            # Store raw route-ray events in R order; role-only rails never cast route rays.
-            event_sources=np.empty(10,np.int8); event_types=np.empty(10,np.int8); event_count=0
-            for s in range(10):
-                typ=int(evt[s,t,q])
-                if typ!=0 and route_on[s]:
-                    rp=ray_price[s,t,q]
-                    if np.isfinite(rp):
-                        reg_count=_store_turn(reg_price,reg_type,reg_bar,reg_source,reg_count,rp,typ,t-1,s,registry_limit)
-                        event_sources[event_count]=s; event_types[event_count]=typ; event_count+=1
-
-            # Next-tick market fill.
-            if order_pending!=0 and ((t>signal_day) or (t==signal_day and q>signal_tick)) and position==0:
-                position=order_pending; entry_price=px; target=order_target; entry_ns=tick_ns; mae=0.0
-                if tick_ns>=eval_start_ns: entries+=1
-                if tick_ns>=fwd_start_ns: entries30+=1
-                order_pending=0; order_target=np.nan; signal_day=-1; signal_tick=-1
-
-            # Historical target market exit.
-            if position!=0:
-                adverse=(entry_price-px)/pip if position==1 else (px-entry_price)/pip
-                if adverse>mae: mae=adverse
-                reached=px>=target if position==1 else px<=target
-                if reached:
-                    pnl=(px-entry_price)/pip if position==1 else (entry_price-px)/pip
-                    hold=max(0.0,(tick_ns-entry_ns)/float(day_ns))
-                    if tick_ns>=eval_start_ns:
-                        closed+=1; wins += 1 if pnl>0 else 0; net+=pnl; max_mae=max(max_mae,mae); longest=max(longest,hold); hold_sum+=hold
-                    if tick_ns>=fwd_start_ns:
-                        closed30+=1; wins30 += 1 if pnl>0 else 0; net30+=pnl
-                    position=0; entry_price=0.0; target=np.nan; entry_ns=0; mae=0.0; exit_day=t
-                    continue
-
-            # A new finalized pivot supersedes an older delayed arm before qualification.
-            if event_count>0 and armed:
-                armed=False
-
-            can_enter = tick_ns>=eval_start_ns and position==0 and order_pending==0 and exit_day!=t
-            submitted=False
-            if can_enter and event_count>0:
-                for ei in range(event_count):
-                    src=int(event_sources[ei]); typ=int(event_types[ei]); cand=1 if typ==1 else -1
-                    # Current Guardian bias + committed direction-flip protection.
-                    guardian_ok=(guard_last==cand and guard_committed==cand)
-                    tgt=_find_target(reg_price,reg_type,reg_bar,reg_source,reg_count,-typ,t-1,route_on)
-                    ahead=np.isfinite(tgt) and ((tgt>px) if cand==1 else (tgt<px))
-                    if not guardian_ok or not ahead:
-                        continue
-                    if td==cand:
-                        order_pending=cand; order_target=tgt; signal_day=t; signal_tick=q; submitted=True
-                        break
-                    else:
-                        # Delayed Confirmation: Guardian-valid pivot arms while Trigger retraces/flat.
-                        armed=True; armed_dir=cand; armed_source=src; armed_type=typ; armed_target=tgt
-                        break
-
-            # Delayed follow-through if nothing was submitted by a newer event.
-            if can_enter and (not submitted) and armed:
-                ahead=np.isfinite(armed_target) and ((armed_target>px) if armed_dir==1 else (armed_target<px))
-                if not ahead:
-                    armed=False
-                elif guard_last==armed_dir and guard_committed==armed_dir and td==armed_dir:
-                    order_pending=armed_dir; order_target=armed_target; signal_day=t; signal_tick=q; armed=False
-
-    avg_hold=hold_sum/closed if closed>0 else 9999.0
-    losses=closed-wins; losses30=closed30-wins30
-    out=np.empty(14,np.float64)
-    out[:] = [entries,closed,wins,losses,net,max_mae,longest,avg_hold,entries30,closed30,wins30,losses30,net30,1 if (position!=0 or order_pending!=0) else 0]
-    return out
-
-
-def metric_row(seed: str, g: str, tr: str, m: np.ndarray, role_only_flags: Dict[str,bool], route_slots=None) -> dict:
-    closed=int(m[1]); wins=int(m[2]); losses=int(m[3]); closed30=int(m[9]); wins30=int(m[10]); losses30=int(m[11])
-    wr=100.0*wins/closed if closed else 0.0
-    if route_slots is None:
-        route_slots=[]
-    route_slots=tuple(route_slots)
-    route_set=set(route_slots)
-    return {
-        "seed":seed,"guardian":g,"trigger":tr,"same_guard_trigger":g==tr,
-        "guardian_role_only":g not in route_set,"trigger_role_only":tr not in route_set,
-        "route_count":len(route_slots),"route_slots":",".join(route_slots),
-        "closed_120d":closed,"wins_120d":wins,"losses_120d":losses,"win_rate_120d":wr,
-        "net_pips_120d":float(m[4]),"max_mae_pips_120d":float(m[5]),"longest_days_120d":float(m[6]),"avg_hold_days_120d":float(m[7]),
-        "closed_30d":closed30,"wins_30d":wins30,"losses_30d":losses30,"net_pips_30d":float(m[12]),"open_or_pending_end":int(m[13]),
-        "sample_quality":sample_quality(closed),
-    }
-
-
-def sample_quality(n: int) -> str:
-    if n>=80: return "VERY STRONG"
-    if n>=40: return "STRONG"
-    if n>=15: return "DEVELOPING"
-    if n>0: return "SMALL SAMPLE"
-    return "NO SAMPLE"
-
-
-def rank_df(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty: return df
-    z=df.copy()
-    if "rank" in z.columns:
-        z=z.drop(columns=["rank"])
-    z["perfect"]=(z.losses_120d==0) & (z.closed_120d>0)
-    sort_cols=["perfect","win_rate_120d","closed_120d","net_pips_120d","max_mae_pips_120d","avg_hold_days_120d","closed_30d"]
-    ascending=[False,False,False,False,True,True,False]
-    # Simplicity is deliberately LAST.  A smaller route set never beats a stronger
-    # trading result merely because it is smaller; it only breaks an actual tie.
-    if "route_count" in z.columns:
-        sort_cols.append("route_count"); ascending.append(True)
-    z=z.sort_values(sort_cols,ascending=ascending,kind="mergesort").reset_index(drop=True)
-    z.insert(0,"rank",np.arange(1,len(z)+1))
-    return z
-
-
-def role_pairs(scope: str, route_on: np.ndarray) -> List[Tuple[str,str]]:
-    if scope=="priority":
-        universe=("R1","R2")
-    elif scope=="active":
-        universe=tuple(SLOTS[i] for i in range(10) if route_on[i])
-    else:
-        universe=SLOTS
-    return [(g,t) for g in universe for t in universe]
-
-
-def seed_manifest(seed: SeedProfile) -> dict:
-    return {slot:{"tf":TF_LABEL[slot],**asdict(seed.rails[slot])} for slot in SLOTS}
-
-
-def _route_slots_from_mask(route_on: np.ndarray) -> Tuple[str,...]:
-    return tuple(SLOTS[i] for i in range(10) if bool(route_on[i]))
-
-
-def _ordered_route_slots(slots) -> Tuple[str,...]:
-    ss=set(slots)
-    return tuple(s for s in SLOTS if s in ss)
-
-
-def macro_micro_pairs() -> List[Tuple[str,str]]:
-    # R1..R10 are ordered slow -> fast, so combinations naturally yield
-    # (Macro, Micro) without forcing Guardian or Trigger to live on either rail.
-    return list(itertools.combinations(SLOTS,2))
-
-
-def performance_key(row) -> tuple:
-    """Lexicographic quality key used to decide whether an extra rail earns its place.
-
-    Route count is intentionally excluded.  A child must improve actual trading
-    behavior; merely adding complexity with identical statistics is NOT an improvement.
-    """
-    get=lambda k,d=0.0: float(row[k]) if k in row and pd.notna(row[k]) else d
-    perfect=1 if get("losses_120d") == 0 and get("closed_120d") > 0 else 0
-    return (
-        perfect,
-        get("win_rate_120d"),
-        get("closed_120d"),
-        get("net_pips_120d"),
-        -get("max_mae_pips_120d",999999.0),
-        -get("avg_hold_days_120d",999999.0),
-        get("closed_30d"),
-    )
-
-
-def strictly_improves(child, parent) -> bool:
-    return performance_key(child) > performance_key(parent)
-
-
-def run_seed(seed: SeedProfile, arrays, daily, inst, eval_start_ns, fwd_start_ns, registry_limit, scope: str) -> pd.DataFrame:
-    evt,ray_price,dirs,commits,route_on=arrays
-    o=daily.open.to_numpy(float); h=daily.high.to_numpy(float); l=daily.low.to_numpy(float); c=daily.close.to_numpy(float)
-    ons=daily.bar_open_ns.to_numpy(np.int64); cns=daily.bar_close_ns.to_numpy(np.int64); pip=pip_size(inst)
-    seed_routes=_route_slots_from_mask(route_on)
-    rows=[]
-    for g,tr in role_pairs(scope,route_on):
-        m=_simulate_role_pair(SLOT_INDEX[g],SLOT_INDEX[tr],evt,ray_price,dirs,commits,route_on,o,h,l,c,ons,cns,eval_start_ns,fwd_start_ns,pip,registry_limit)
-        row=metric_row(seed.name,g,tr,m,{},seed_routes)
-        row.update({"macro":"","micro":"","bridge_rail":"","fourth_rail":"","generation":0,
-                    "parent_route_slots":"","earned_addition":False})
-        rows.append(row)
-    return rank_df(pd.DataFrame(rows))
-
-
-def select_role_candidates(expanded: pd.DataFrame, per_seed: int, carry_priority: bool=True) -> pd.DataFrame:
-    parts=[]
-    for seed_name,grp in expanded.groupby("seed",sort=False):
-        parts.append(rank_df(grp).head(per_seed))
-        if carry_priority:
-            p=grp[grp.guardian.isin(["R1","R2"]) & grp.trigger.isin(["R1","R2"])]
-            if not p.empty: parts.append(p)
-    if not parts:
-        return expanded.head(0)
-    z=pd.concat(parts,ignore_index=True)
-    z=z.drop_duplicates(["seed","guardian","trigger"],keep="first")
-    return rank_df(z)
-
-
-def _sim_inputs(daily, inst):
-    return (
-        daily.open.to_numpy(float), daily.high.to_numpy(float), daily.low.to_numpy(float), daily.close.to_numpy(float),
-        daily.bar_open_ns.to_numpy(np.int64), daily.bar_close_ns.to_numpy(np.int64), pip_size(inst)
-    )
-
-
-def _simulate_routes(seed_name, g, tr, slots, arrays_by_seed, sim_inputs, eval_start_ns, fwd_start_ns, registry_limit):
-    evt,ray_price,dirs,commits,_seed_route=arrays_by_seed[seed_name]
-    o,h,l,c,ons,cns,pip=sim_inputs
-    route_on=np.zeros(10,np.bool_)
-    for s in slots: route_on[SLOT_INDEX[s]]=True
-    return _simulate_role_pair(
-        SLOT_INDEX[g],SLOT_INDEX[tr],evt,ray_price,dirs,commits,route_on,
-        o,h,l,c,ons,cns,eval_start_ns,fwd_start_ns,pip,registry_limit
-    )
-
-
-def run_macro_micro(role_candidates: pd.DataFrame, arrays_by_seed, daily, inst, eval_start_ns, fwd_start_ns, registry_limit) -> pd.DataFrame:
-    pairs=macro_micro_pairs(); sim_inputs=_sim_inputs(daily,inst)
-    rows=[]; total=len(role_candidates)*len(pairs); done=0
-    print(f"      Macro/Micro pairs per role candidate: {len(pairs):,} | joint tests: {total:,}")
-    for _,cand in role_candidates.iterrows():
-        seed_name=str(cand.seed); g=str(cand.guardian); tr=str(cand.trigger)
-        for macro,micro in pairs:
-            slots=(macro,micro)
-            m=_simulate_routes(seed_name,g,tr,slots,arrays_by_seed,sim_inputs,eval_start_ns,fwd_start_ns,registry_limit)
-            row=metric_row(seed_name,g,tr,m,{},slots)
-            row.update({"macro":macro,"micro":micro,"bridge_rail":"","fourth_rail":"","generation":2,
-                        "parent_route_slots":"","earned_addition":True,
-                        "delta_closed":0,"delta_net_pips":0.0,"delta_win_rate":0.0,"delta_mae_pips":0.0})
-            rows.append(row); done+=1
-            if done % 500 == 0 or done==total:
-                print(f"      macro/micro progress: {done:,}/{total:,}")
-    return rank_df(pd.DataFrame(rows))
-
-
-def select_route_candidates(df: pd.DataFrame, per_seed: int) -> pd.DataFrame:
-    if df.empty: return df
-    parts=[]
-    for _,grp in df.groupby("seed",sort=False):
-        parts.append(rank_df(grp).head(per_seed))
-    z=pd.concat(parts,ignore_index=True) if parts else df.head(0)
-    if z.empty: return z
-    return rank_df(z.drop_duplicates(["seed","guardian","trigger","route_slots"],keep="first"))
-
-
-def run_added_rail_challenge(parents: pd.DataFrame, arrays_by_seed, daily, inst, eval_start_ns, fwd_start_ns,
-                             registry_limit, generation: int) -> Tuple[pd.DataFrame,pd.DataFrame]:
-    """Challenge one additional route rail against each exact parent.
-
-    generation=3 adds the bridge rail to a Macro/Micro parent.
-    generation=4 adds a fourth rail only to an already-earned three-rail parent.
-    """
-    sim_inputs=_sim_inputs(daily,inst); rows=[]
-    total=sum(10-len(tuple(x for x in str(r.route_slots).split(",") if x)) for _,r in parents.iterrows())
-    done=0
-    label="bridge" if generation==3 else "fourth"
-    print(f"      {label.title()} challenges: {total:,}")
-    for _,parent in parents.iterrows():
-        seed_name=str(parent.seed); g=str(parent.guardian); tr=str(parent.trigger)
-        base_slots=tuple(x for x in str(parent.route_slots).split(",") if x)
-        base_set=set(base_slots)
-        for add in SLOTS:
-            if add in base_set: continue
-            slots=_ordered_route_slots(base_slots+(add,))
-            m=_simulate_routes(seed_name,g,tr,slots,arrays_by_seed,sim_inputs,eval_start_ns,fwd_start_ns,registry_limit)
-            row=metric_row(seed_name,g,tr,m,{},slots)
-            row.update({
-                "macro":str(parent.get("macro","")),"micro":str(parent.get("micro","")),
-                "bridge_rail": add if generation==3 else str(parent.get("bridge_rail","")),
-                "fourth_rail": add if generation==4 else "",
-                "generation":generation,
-                "parent_route_slots":str(parent.route_slots),
-                "delta_closed":int(row["closed_120d"])-int(parent.closed_120d),
-                "delta_net_pips":float(row["net_pips_120d"])-float(parent.net_pips_120d),
-                "delta_win_rate":float(row["win_rate_120d"])-float(parent.win_rate_120d),
-                "delta_mae_pips":float(row["max_mae_pips_120d"])-float(parent.max_mae_pips_120d),
-            })
-            row["earned_addition"]=strictly_improves(row,parent)
-            rows.append(row); done+=1
-            if done % 250 == 0 or done==total:
-                print(f"      {label} progress: {done:,}/{total:,}")
-    all_df=rank_df(pd.DataFrame(rows)) if rows else pd.DataFrame()
-    earned=rank_df(all_df[all_df.earned_addition].copy()) if not all_df.empty and all_df.earned_addition.any() else all_df.head(0)
-    return all_df,earned
-
-
-def route_profile_manifest(seed: SeedProfile, route_slots) -> dict:
-    route_set=set(route_slots)
-    out={}
-    for slot in SLOTS:
-        d={"tf":TF_LABEL[slot],**asdict(seed.rails[slot])}
-        d["route"]=slot in route_set
-        out[slot]=d
-    return out
-
-
-def parse_args():
-    p=argparse.ArgumentParser(description="TGIM Macro/Micro-first Guardian/Trigger + earned-extra-rail sweeper")
-    p.add_argument("--instrument",required=False,default="EUR_USD")
-    p.add_argument("--token",default=os.getenv("OANDA_TOKEN", ""))
-    p.add_argument("--env",choices=["practice","live"],default=os.getenv("OANDA_ENV","practice"))
-    p.add_argument("--seed",choices=["both","AUD51","EUR47"],default="both")
-    p.add_argument("--eval-days",type=int,default=120)
-    p.add_argument("--forward-days",type=int,default=30)
-    p.add_argument("--warmup-days",type=int,default=90)
-    p.add_argument("--registry-limit",type=int,default=27)
-    p.add_argument("--expanded-scope",choices=["active","all10"],default="all10")
-    p.add_argument("--skip-expanded",action="store_true")
-    p.add_argument("--role-top-per-seed",type=int,default=100,help="G/T relationships per seed carried into Macro/Micro discovery; default 100 = every R1-R10 x R1-R10 relationship")
-    p.add_argument("--no-carry-priority",action="store_true",help="Do not force the four R1/R2 priority G/T pairs into Macro/Micro stage")
-    p.add_argument("--macro-micro-top-per-seed",type=int,default=50,help="Top two-rail structures per seed allowed to challenge a bridge rail")
-    p.add_argument("--bridge-top-per-seed",type=int,default=30,help="Top earned three-rail structures per seed allowed to challenge a fourth rail")
-    p.add_argument("--skip-bridge",action="store_true")
-    p.add_argument("--skip-fourth",action="store_true")
-    p.add_argument("--refresh",action="store_true")
-    p.add_argument("--cache-dir",default="./cache")
-    p.add_argument("--result-dir",default="")
-    p.add_argument("--self-test",action="store_true")
+def parse_args() -> argparse.Namespace:
+    here = Path(__file__).resolve().parent
+    p = argparse.ArgumentParser(description="TGIM v3.2 sequential Macro/Micro multi-pair runner")
+    p.add_argument("--sweeper", default=str(here / "tgim_joint_4rail_sweeper_v1.py"),
+                   help="Path to the v3.2 single-pair sweeper")
+    p.add_argument("--pairs", default="",
+                   help="Comma-separated override list. Default = remaining 45 pairs.")
+    p.add_argument("--include-references", action="store_true",
+                   help="Include EUR_USD and AUD_USD ahead of the remaining universe.")
+    p.add_argument("--start-at", default="",
+                   help="Start at this pair within the selected list; useful for manual resume.")
+    p.add_argument("--max-pairs", type=int, default=0,
+                   help="Optional cap for a test run; 0 means all selected pairs.")
+    p.add_argument("--result-root", default="batch_results",
+                   help="Root folder for this batch's pair result directories and summaries.")
+    p.add_argument("--cache-dir", default="./cache",
+                   help="Shared candle cache passed to every pair sweep.")
+    p.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True,
+                   help="Skip a pair if its promotion JSON already exists in this batch folder.")
+    p.add_argument("--stop-on-error", action="store_true",
+                   help="Stop batch after first failed pair. Default continues.")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Print pair sequence and commands without executing sweeps.")
+
+    # Core single-pair sweeper args passed through unchanged.
+    p.add_argument("--env", choices=["practice", "live"], default=os.getenv("OANDA_ENV", "practice"))
+    p.add_argument("--token", default=os.getenv("OANDA_TOKEN", ""))
+    p.add_argument("--eval-days", type=int, default=120)
+    p.add_argument("--forward-days", type=int, default=30)
+    p.add_argument("--warmup-days", type=int, default=90)
+    p.add_argument("--registry-limit", type=int, default=27)
+    p.add_argument("--seed", choices=["both", "AUD51", "EUR47"], default="both")
+    p.add_argument("--expanded-scope", choices=["active", "all10"], default="all10")
+    p.add_argument("--macro-top-per-seed", type=int, default=50)
+    p.add_argument("--bridge-top-per-seed", type=int, default=10)
+    p.add_argument("--skip-bridge", action="store_true")
+    p.add_argument("--skip-fourth", action="store_true")
+    p.add_argument("--refresh", action="store_true")
     return p.parse_args()
 
 
-def self_test() -> int:
-    nd=20; evt=np.zeros((10,nd,4),np.int8); rp=np.full((10,nd,4),np.nan); dirs=np.ones((10,nd,4),np.int8); cm=np.zeros((10,nd,4),np.bool_); cm[:,:,0]=True
-    route=np.zeros(10,np.bool_); route[0]=route[1]=True
-    for t in (3,6,9,12,15):
-        typ=1 if (t//3)%2 else -1
-        evt[0,t,0]=typ; rp[0,t,0]=1.0 + 0.01*t
-    x=np.linspace(1.0,1.3,nd); o=x.copy(); h=x+0.01; l=x-0.01; c=x+0.005
-    ons=np.arange(nd,dtype=np.int64)*86_400_000_000_000; cns=ons+86_400_000_000_000
-    m=_simulate_role_pair(0,0,evt,rp,dirs,cm,route,o,h,l,c,ons,cns,0,ons[-5],0.0001,27)
-    assert len(macro_micro_pairs())==45
-    a=metric_row("X","R1","R2",m,{},("R1","R2")); b=dict(a); b["net_pips_120d"]=a["net_pips_120d"]+1
-    assert strictly_improves(b,a)
-    c=dict(a); c["route_count"]=3; c["route_slots"]="R1,R2,R3"
-    assert not strictly_improves(c,a)
-    test=pd.DataFrame([a,c]); ranked=rank_df(rank_df(test)); assert list(ranked["rank"])==[1,2]
-    print("SELF TEST OK", m.tolist(), "macro_micro_pairs=45", "earned-extra logic OK"); return 0
+def pair_sequence(args: argparse.Namespace) -> List[str]:
+    if args.pairs:
+        seq = parse_pairs(args.pairs)
+    else:
+        seq = list(DEFAULT_45)
+        if args.include_references:
+            seq = ["EUR_USD", "AUD_USD"] + seq
+
+    if args.start_at:
+        start = norm_pair(args.start_at)
+        if start not in seq:
+            raise SystemExit(f"--start-at {start} is not in the selected pair list")
+        seq = seq[seq.index(start):]
+
+    if args.max_pairs > 0:
+        seq = seq[:args.max_pairs]
+    return seq
+
+
+def read_json(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def safe_float(v, default=0.0) -> float:
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+
+def safe_int(v, default=0) -> int:
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+
+def promotion_row(pair: str, promo: dict, pair_dir: Path, elapsed: float) -> dict:
+    m = promo.get("metrics", {})
+    return {
+        "pair": pair,
+        "tier": TIER_BY_PAIR.get(pair, "custom"),
+        "status": "DONE",
+        "seed_math": promo.get("seed_math_profile", ""),
+        "guardian": promo.get("guardian_source", ""),
+        "trigger": promo.get("trigger_source", ""),
+        "macro": promo.get("macro_route", ""),
+        "micro": promo.get("micro_route", ""),
+        "bridge": promo.get("bridge_rail", ""),
+        "fourth": promo.get("fourth_rail", ""),
+        "route_count": safe_int(promo.get("route_count", 0)),
+        "route_slots": ",".join(promo.get("route_slots", []) or []),
+        "role_only": ",".join(promo.get("role_only_enable_required", []) or []),
+        "closed_120d": safe_int(m.get("closed_120d", 0)),
+        "wins_120d": safe_int(m.get("wins_120d", 0)),
+        "losses_120d": safe_int(m.get("losses_120d", 0)),
+        "win_rate_120d": safe_float(m.get("win_rate_120d", 0.0)),
+        "net_pips_120d": safe_float(m.get("net_pips_120d", 0.0)),
+        "max_mae_pips_120d": safe_float(m.get("max_mae_pips_120d", 0.0)),
+        "avg_hold_days_120d": safe_float(m.get("avg_hold_days_120d", 9999.0)),
+        "closed_30d": safe_int(m.get("closed_30d", 0)),
+        "wins_30d": safe_int(m.get("wins_30d", 0)),
+        "losses_30d": safe_int(m.get("losses_30d", 0)),
+        "sample_quality": promo.get("sample_quality", ""),
+        "elapsed_seconds": round(elapsed, 3),
+        "result_dir": str(pair_dir),
+    }
+
+
+def error_row(pair: str, pair_dir: Path, elapsed: float, returncode: int, message: str) -> dict:
+    return {
+        "pair": pair, "tier": TIER_BY_PAIR.get(pair, "custom"), "status": "FAILED",
+        "seed_math": "", "guardian": "", "trigger": "", "macro": "", "micro": "",
+        "bridge": "", "fourth": "", "route_count": 0, "route_slots": "", "role_only": "",
+        "closed_120d": 0, "wins_120d": 0, "losses_120d": 0, "win_rate_120d": 0.0,
+        "net_pips_120d": 0.0, "max_mae_pips_120d": 0.0, "avg_hold_days_120d": 9999.0,
+        "closed_30d": 0, "wins_30d": 0, "losses_30d": 0, "sample_quality": "",
+        "elapsed_seconds": round(elapsed, 3), "result_dir": str(pair_dir),
+        "returncode": returncode, "error": message[:1000],
+    }
+
+
+def write_csv(path: Path, rows: List[dict]) -> None:
+    if not rows:
+        return
+    fields = []
+    seen = set()
+    for row in rows:
+        for k in row.keys():
+            if k not in seen:
+                fields.append(k); seen.add(k)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader(); w.writerows(rows)
+
+
+def champion_key(row: dict) -> tuple:
+    if row.get("status") != "DONE":
+        return (0, 0.0, 0, float("-inf"), float("-inf"), float("-inf"), float("-inf"))
+    losses = safe_int(row.get("losses_120d", 0))
+    closed = safe_int(row.get("closed_120d", 0))
+    perfect = 1 if losses == 0 and closed > 0 else 0
+    return (
+        perfect,
+        safe_float(row.get("win_rate_120d", 0.0)),
+        closed,
+        safe_float(row.get("net_pips_120d", 0.0)),
+        -safe_float(row.get("max_mae_pips_120d", 0.0)),
+        -safe_float(row.get("avg_hold_days_120d", 9999.0)),
+        safe_int(row.get("closed_30d", 0)),
+    )
+
+
+def print_pair_header(index: int, total: int, pair: str) -> None:
+    print("\n" + "=" * 84, flush=True)
+    print(f"TGIM BATCH {index}/{total} | PAIR BEING SWEPT: {pair} | TIER {TIER_BY_PAIR.get(pair, 'custom')}", flush=True)
+    print("=" * 84, flush=True)
+
+
+def build_command(args: argparse.Namespace, sweeper: Path, pair: str, pair_dir: Path) -> List[str]:
+    cmd = [
+        sys.executable, str(sweeper),
+        "--instrument", pair,
+        "--env", args.env,
+        "--eval-days", str(args.eval_days),
+        "--forward-days", str(args.forward_days),
+        "--warmup-days", str(args.warmup_days),
+        "--registry-limit", str(args.registry_limit),
+        "--seed", args.seed,
+        "--expanded-scope", args.expanded_scope,
+        "--macro-top-per-seed", str(args.macro_top_per_seed),
+        "--bridge-top-per-seed", str(args.bridge_top_per_seed),
+        "--cache-dir", args.cache_dir,
+        "--result-dir", str(pair_dir),
+    ]
+    if args.token:
+        cmd += ["--token", args.token]
+    if args.skip_bridge:
+        cmd.append("--skip-bridge")
+    if args.skip_fourth:
+        cmd.append("--skip-fourth")
+    if args.refresh:
+        cmd.append("--refresh")
+    return cmd
+
+
+def run_and_tee(cmd: List[str], log_path: Path) -> Tuple[int, str]:
+    tail: List[str] = []
+    with log_path.open("w", encoding="utf-8") as log:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            print(line, end="", flush=True)
+            log.write(line); log.flush()
+            tail.append(line.rstrip())
+            if len(tail) > 40:
+                tail = tail[-40:]
+        rc = proc.wait()
+    return rc, "\n".join(tail)
+
+
+def write_batch_outputs(root: Path, rows: List[dict], seq: List[str], started_at: str) -> None:
+    write_csv(root / "PAIR_STATUS.csv", rows)
+    done = sorted((r for r in rows if r.get("status") == "DONE"), key=champion_key, reverse=True)
+    write_csv(root / "CHAMPION_LEADERBOARD.csv", done)
+
+    bank: Dict[str, dict] = {}
+    for row in rows:
+        if row.get("status") != "DONE":
+            continue
+        promo = Path(str(row["result_dir"])) / "PAIR_PROFILE_PROMOTION.json"
+        if promo.exists():
+            try:
+                bank[row["pair"].replace("_", "")] = read_json(promo)
+            except Exception:
+                pass
+    (root / "PAIR_PROFILE_PROMOTION_BANK.json").write_text(json.dumps(bank, indent=2), encoding="utf-8")
+
+    progress = {
+        "batch_build_id": BATCH_BUILD_ID,
+        "expected_sweeper_build": EXPECTED_SWEEPER_BUILD,
+        "started_at_utc": started_at,
+        "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "selected_pairs": seq,
+        "selected_count": len(seq),
+        "done_count": sum(1 for r in rows if r.get("status") == "DONE"),
+        "failed_count": sum(1 for r in rows if r.get("status") == "FAILED"),
+        "pending_count": max(0, len(seq) - len(rows)),
+        "last_pair": rows[-1]["pair"] if rows else None,
+        "last_status": rows[-1]["status"] if rows else None,
+    }
+    (root / "BATCH_PROGRESS.json").write_text(json.dumps(progress, indent=2), encoding="utf-8")
 
 
 def main() -> int:
-    args=parse_args()
-    if args.self_test: return self_test()
-    inst=instrument_norm(args.instrument)
-    if args.forward_days<=0 or args.eval_days<=0 or args.forward_days>args.eval_days:
-        raise SystemExit("Require 0 < forward-days <= eval-days")
-    if args.registry_limit<3 or args.registry_limit>MAX_REGISTRY:
-        raise SystemExit(f"registry-limit must be 3..{MAX_REGISTRY}")
-    if args.role_top_per_seed<1 or args.macro_micro_top_per_seed<1 or args.bridge_top_per_seed<1:
-        raise SystemExit("carry counts must all be >= 1")
+    args = parse_args()
+    sweeper = Path(args.sweeper).resolve()
+    if not sweeper.exists():
+        raise SystemExit(f"Sweeper not found: {sweeper}")
 
-    now=datetime.now(timezone.utc)
-    start=now-timedelta(days=args.eval_days+args.warmup_days+30)
-    end=now+timedelta(days=1)
-    cache=Path(args.cache_dir)
-    hist=OandaHistory(args.token,args.env,cache)
+    seq = pair_sequence(args)
+    if not seq:
+        raise SystemExit("No pairs selected")
 
-    print(f"TGIM MACRO/MICRO SWEEPER v3.2 | {inst}")
-    print("[1/9] Fetching fixed R1-R10 timeframe history ...")
-    raw={}
-    for gran in sorted(set(TF.values()), key=lambda x:(x!="D",x)):
-        raw[gran]=hist.candles(inst,gran,start,end,args.refresh)
-        print(f"      {gran:>3}: {len(raw[gran]):,} candles")
-    daily=daily_execution_frame(raw["D"])
-    if len(daily)<20: raise SystemExit("Not enough complete Daily bars")
-    last_close_ns=int(daily.bar_close_ns.iloc[-1])
-    eval_start_ns=last_close_ns-args.eval_days*86_400_000_000_000
-    fwd_start_ns=last_close_ns-args.forward_days*86_400_000_000_000
+    # One stable root per invocation unless the user explicitly chooses a named root.
+    root = Path(args.result_root).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    started_at = datetime.now(timezone.utc).isoformat()
 
-    selected=[AUD51,EUR47] if args.seed=="both" else [SEEDS[args.seed]]
-    outdir=Path(args.result_dir) if args.result_dir else Path("results")/f"{inst}_{BUILD_ID}"
-    outdir.mkdir(parents=True,exist_ok=True)
+    print("=" * 84)
+    print("TGIM MACRO/MICRO AUTOMATIC PAIR BATCH")
+    print(f"BATCH BUILD: {BATCH_BUILD_ID}")
+    print(f"SINGLE-PAIR ENGINE: {sweeper.name}")
+    print(f"PAIRS SELECTED: {len(seq)}")
+    print("SEQUENCE: " + " -> ".join(seq))
+    print(f"RESULT ROOT: {root}")
+    print("=" * 84, flush=True)
 
-    print("[2/9] Preparing all ten R-bay rail/event arrays for each seed math family ...")
-    arrays={s.name:prepare_seed_arrays(raw,daily,s) for s in selected}
+    if args.dry_run:
+        for i, pair in enumerate(seq, 1):
+            pair_dir = root / pair
+            print_pair_header(i, len(seq), pair)
+            print(" ".join(build_command(args, sweeper, pair, pair_dir)))
+        return 0
 
-    print("[3/9] PRIORITY role sweep: R1/R2 x R1/R2, independent profiles OFF ...")
-    pri=[]
-    for s in selected:
-        pri.append(run_seed(s,arrays[s.name],daily,inst,eval_start_ns,fwd_start_ns,args.registry_limit,"priority"))
-    priority=rank_df(pd.concat(pri,ignore_index=True))
-    priority.to_csv(outdir/"STAGE1_PRIORITY_R1_R2.csv",index=False)
-    print(priority[["rank","seed","guardian","trigger","closed_120d","wins_120d","losses_120d","win_rate_120d","closed_30d","net_pips_120d"]].head(12).to_string(index=False))
+    rows: List[dict] = []
 
-    expanded=priority
-    if not args.skip_expanded:
-        print(f"[4/9] EXPANDED role sweep: {args.expanded_scope} Guardian x Trigger ...")
-        allrows=[]
-        for s in selected:
-            allrows.append(run_seed(s,arrays[s.name],daily,inst,eval_start_ns,fwd_start_ns,args.registry_limit,args.expanded_scope))
-        expanded=rank_df(pd.concat(allrows,ignore_index=True))
-        expanded.to_csv(outdir/"STAGE1_EXPANDED_GUARD_TRIGGER.csv",index=False)
-        print(expanded[["rank","seed","guardian","trigger","closed_120d","wins_120d","losses_120d","win_rate_120d","closed_30d","net_pips_120d"]].head(20).to_string(index=False))
-    else:
-        print("[4/9] Expanded sweep skipped; Macro/Micro uses priority roles only.")
+    # Resume from existing status CSV if available, but only trust pair result JSONs.
+    for i, pair in enumerate(seq, 1):
+        print_pair_header(i, len(seq), pair)
+        pair_dir = root / pair
+        pair_dir.mkdir(parents=True, exist_ok=True)
+        promo_path = pair_dir / "PAIR_PROFILE_PROMOTION.json"
 
-    role_candidates=select_role_candidates(expanded,args.role_top_per_seed,carry_priority=not args.no_carry_priority)
-    role_candidates.to_csv(outdir/"STAGE2_ROLE_CANDIDATES_CARRIED.csv",index=False)
+        if args.resume and promo_path.exists():
+            try:
+                promo = read_json(promo_path)
+                row = promotion_row(pair, promo, pair_dir, 0.0)
+                row["status"] = "SKIPPED_EXISTING"
+                rows.append(row)
+                print(f"[{pair}] Existing promotion found; skipping (--resume).", flush=True)
+                write_batch_outputs(root, rows, seq, started_at)
+                continue
+            except Exception as exc:
+                print(f"[{pair}] Existing promotion unreadable; rerunning: {exc}", flush=True)
 
-    print("[5/9] MACRO/MICRO DISCOVERY: every two-rail route pair ...")
-    print(f"      Carrying {len(role_candidates)} G/T candidates. G/T may remain role-only.")
-    macro_micro=run_macro_micro(role_candidates,arrays,daily,inst,eval_start_ns,fwd_start_ns,args.registry_limit)
-    macro_micro.to_csv(outdir/"STAGE2_MACRO_MICRO_ALL.csv",index=False)
-    macro_micro.head(100).to_csv(outdir/"STAGE2_TOP100_MACRO_MICRO.csv",index=False)
-    print(macro_micro[["rank","seed","guardian","trigger","macro","micro","route_slots","closed_120d","wins_120d","losses_120d","win_rate_120d","closed_30d","net_pips_120d"]].head(25).to_string(index=False))
+        cmd = build_command(args, sweeper, pair, pair_dir)
+        print(f"[{pair}] COMMAND: {' '.join(cmd)}", flush=True)
+        t0 = time.monotonic()
+        rc, tail = run_and_tee(cmd, pair_dir / "SWEEPER_STDOUT.log")
+        elapsed = time.monotonic() - t0
 
-    final_parts=[macro_micro]
-    bridge_all=bridge_earned=macro_micro.head(0)
-    if not args.skip_bridge:
-        bridge_parents=select_route_candidates(macro_micro,args.macro_micro_top_per_seed)
-        bridge_parents.to_csv(outdir/"STAGE3_BRIDGE_PARENTS.csv",index=False)
-        print("[6/9] BRIDGE CHALLENGE: one extra route rail must strictly improve its Macro/Micro parent ...")
-        bridge_all,bridge_earned=run_added_rail_challenge(
-            bridge_parents,arrays,daily,inst,eval_start_ns,fwd_start_ns,args.registry_limit,3
+        if rc == 0 and promo_path.exists():
+            try:
+                promo = read_json(promo_path)
+                row = promotion_row(pair, promo, pair_dir, elapsed)
+                rows.append(row)
+                print(
+                    f"[{pair}] COMPLETE | G {row['guardian']} | T {row['trigger']} | "
+                    f"Macro {row['macro']} | Micro {row['micro']} | routes {row['route_slots']} | "
+                    f"{row['wins_120d']}/{row['closed_120d']} | {row['win_rate_120d']:.2f}%",
+                    flush=True,
+                )
+            except Exception as exc:
+                row = error_row(pair, pair_dir, elapsed, rc, f"Promotion parse failed: {exc}\n{tail}")
+                rows.append(row)
+                print(f"[{pair}] FAILED TO PARSE PROMOTION: {exc}", flush=True)
+        else:
+            row = error_row(pair, pair_dir, elapsed, rc, tail or "No promotion file produced")
+            rows.append(row)
+            print(f"[{pair}] FAILED | exit={rc}; continuing={not args.stop_on_error}", flush=True)
+
+        write_batch_outputs(root, rows, seq, started_at)
+
+        if row["status"] == "FAILED" and args.stop_on_error:
+            break
+
+    # Reclassify resume rows as DONE in final outputs so leaderboard includes them.
+    for row in rows:
+        if row.get("status") == "SKIPPED_EXISTING":
+            row["status"] = "DONE"
+    write_batch_outputs(root, rows, seq, started_at)
+
+    done = [r for r in rows if r.get("status") == "DONE"]
+    failed = [r for r in rows if r.get("status") == "FAILED"]
+    leaderboard = sorted(done, key=champion_key, reverse=True)
+
+    print("\n" + "=" * 84)
+    print("TGIM AUTOMATIC BATCH COMPLETE")
+    print(f"DONE: {len(done)} | FAILED: {len(failed)} | SELECTED: {len(seq)}")
+    if leaderboard:
+        top = leaderboard[0]
+        print(
+            f"CURRENT BATCH LEADER: {top['pair']} | {top['wins_120d']}/{top['closed_120d']} | "
+            f"{top['win_rate_120d']:.2f}% | G {top['guardian']} | T {top['trigger']} | "
+            f"Macro {top['macro']} | Micro {top['micro']} | routes {top['route_slots']}"
         )
-        bridge_all.to_csv(outdir/"STAGE3_BRIDGE_ALL.csv",index=False)
-        bridge_earned.to_csv(outdir/"STAGE3_BRIDGE_EARNED.csv",index=False)
-        print(f"      Bridges that earned their place: {len(bridge_earned):,}/{len(bridge_all):,}")
-        if not bridge_earned.empty:
-            print(bridge_earned[["rank","seed","guardian","trigger","macro","micro","bridge_rail","route_slots","delta_closed","delta_net_pips","closed_120d","wins_120d","losses_120d","win_rate_120d","net_pips_120d"]].head(25).to_string(index=False))
-            final_parts.append(bridge_earned)
-    else:
-        print("[6/9] Bridge challenge skipped by request.")
+    print(f"PAIR STATUS: {root / 'PAIR_STATUS.csv'}")
+    print(f"LEADERBOARD: {root / 'CHAMPION_LEADERBOARD.csv'}")
+    print(f"PROMOTION BANK: {root / 'PAIR_PROFILE_PROMOTION_BANK.json'}")
+    print("=" * 84, flush=True)
 
-    fourth_all=fourth_earned=macro_micro.head(0)
-    if not args.skip_fourth and not bridge_earned.empty:
-        fourth_parents=select_route_candidates(bridge_earned,args.bridge_top_per_seed)
-        fourth_parents.to_csv(outdir/"STAGE4_FOURTH_PARENTS.csv",index=False)
-        print("[7/9] FOURTH-RAIL CHALLENGE: only earned bridge structures may add one more rail ...")
-        fourth_all,fourth_earned=run_added_rail_challenge(
-            fourth_parents,arrays,daily,inst,eval_start_ns,fwd_start_ns,args.registry_limit,4
-        )
-        fourth_all.to_csv(outdir/"STAGE4_FOURTH_ALL.csv",index=False)
-        fourth_earned.to_csv(outdir/"STAGE4_FOURTH_EARNED.csv",index=False)
-        print(f"      Fourth rails that earned their place: {len(fourth_earned):,}/{len(fourth_all):,}")
-        if not fourth_earned.empty:
-            final_parts.append(fourth_earned)
-    elif args.skip_fourth:
-        print("[7/9] Fourth-rail challenge skipped by request.")
-    else:
-        print("[7/9] No earned bridge structures; fourth rail is not allowed to audition.")
-
-    final_ranked=rank_df(pd.concat(final_parts,ignore_index=True))
-    final_ranked.to_csv(outdir/"FINAL_CANDIDATES.csv",index=False)
-    final_ranked.head(100).to_csv(outdir/"TOP100_FINAL_CANDIDATES.csv",index=False)
-
-    print("[8/9] Writing pair-profile promotion package ...")
-    best=final_ranked.iloc[0].to_dict(); best_seed=SEEDS[str(best["seed"])]
-    route_slots=tuple(x for x in str(best.get("route_slots","" )).split(",") if x)
-    role_only_required=sorted(set(x for x in (str(best["guardian"]),str(best["trigger"])) if x not in set(route_slots)))
-    promotion={
-        "build_id":BUILD_ID,
-        "instrument":inst,
-        "pair_key":pair_key(inst),
-        "stage":"MACRO_MICRO_WITH_EARNED_EXTRAS",
-        "guardian_independent_profile":False,
-        "trigger_independent_profile":False,
-        "guardian_source":str(best["guardian"]),
-        "trigger_source":str(best["trigger"]),
-        "same_guard_trigger":bool(best["same_guard_trigger"]),
-        "macro_route":str(best.get("macro","")),
-        "micro_route":str(best.get("micro","")),
-        "bridge_rail":str(best.get("bridge_rail","")),
-        "fourth_rail":str(best.get("fourth_rail","")),
-        "route_slots":list(route_slots),
-        "route_count":len(route_slots),
-        "role_only_enable_required":role_only_required,
-        "seed_math_profile":best_seed.name,
-        "route_profile":route_profile_manifest(best_seed,route_slots),
-        "minimum_sufficient_structure":True,
-        "extra_rail_rule":"A third/fourth route rail is eligible only when it strictly improves its exact parent on the trading-performance lexicographic key; equal results are rejected as unnecessary complexity.",
-        "trade_contract":{
-            "target_scope":"Any Route R","after_target_exit":"One Leg Only","entry_qualification":"Delayed Confirmation",
-            "historical_turns":args.registry_limit,"clutter":False,"adx_gates":False,"guardian_break":"Guardian Direction Flip"
-        },
-        "metrics":{
-            k:(int(best[k]) if k.startswith(("closed","wins","losses","open","route_count")) else float(best[k]))
-            for k in ["closed_120d","wins_120d","losses_120d","win_rate_120d","net_pips_120d","max_mae_pips_120d","longest_days_120d","avg_hold_days_120d","closed_30d","wins_30d","losses_30d","net_pips_30d","open_or_pending_end"]
-        },
-        "sample_quality":str(best["sample_quality"]),
-        "next_stage":"Freeze Guardian/Trigger + minimum sufficient Macro/Micro route architecture. Then sweep MA family and length on the retained route rails and role-only rails; RAW/ZAG follows; independent Guardian/Trigger profiles remain later stages.",
-        "tradingview_verification_required":True,
-    }
-    (outdir/"PAIR_PROFILE_PROMOTION.json").write_text(json.dumps(promotion,indent=2))
-    (outdir/"SEED_MATH_PROFILES.json").write_text(json.dumps({s.name:seed_manifest(s) for s in selected},indent=2))
-    manifest={
-        "build_id":BUILD_ID,"instrument":inst,"eval_days":args.eval_days,"forward_days":args.forward_days,
-        "registry_limit":args.registry_limit,"seeds":[s.name for s in selected],"expanded_scope":args.expanded_scope,
-        "priority_tests":len(priority),"expanded_tests":len(expanded),"role_candidates":len(role_candidates),
-        "macro_micro_pairs_per_role":45,"macro_micro_joint_tests":len(macro_micro),
-        "bridge_tests":len(bridge_all),"bridge_earned":len(bridge_earned),
-        "fourth_tests":len(fourth_all),"fourth_earned":len(fourth_earned),"result_dir":str(outdir),
-    }
-    (outdir/"RUN_MANIFEST.json").write_text(json.dumps(manifest,indent=2))
-
-    print("[9/9] DONE")
-    print(f"      Winner: {best_seed.name} math | Guardian {best['guardian']} | Trigger {best['trigger']} | Macro {best.get('macro','')} | Micro {best.get('micro','')} | routes {','.join(route_slots)} | {int(best['wins_120d'])}/{int(best['closed_120d'])} | {float(best['win_rate_120d']):.2f}%")
-    if str(best.get("bridge_rail","")):
-        print(f"      Bridge earned: {best.get('bridge_rail')}")
-    if str(best.get("fourth_rail","")):
-        print(f"      Fourth rail earned: {best.get('fourth_rail')}")
-    if role_only_required:
-        print("      Role-only R calculation required (route rays OFF): " + ", ".join(role_only_required))
-    print(f"      Results: {outdir}")
-    print("      Minimum sufficient structure enforced: extra route rails survive only when they improve the parent result.")
-    print("      This pair is NOT required to match AUDUSD 51/51 or EURUSD 47/47. It wins on its own statistics.")
-    return 0
+    # Continue-through-errors is the default; nonzero only if nothing completed.
+    return 0 if done else 2
 
 
 if __name__ == "__main__":
