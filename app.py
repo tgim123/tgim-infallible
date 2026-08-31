@@ -1,46 +1,78 @@
-# TGIM OANDA Dynamic Margin + Spread Webhook v7.2 — Portfolio Slot + Rollover Lock
-# ------------------------------------------------------------
-# Drop-in replacement for app.py on Render.
+# TGIM OANDA Dynamic Margin + Spread Webhook v7.3 — Broker Ledger + Reconcile
+# ---------------------------------------------------------------------------
+# Drop-in replacement for the current v7.2 app.py on Render.
 # OANDA-only.
+#
+# IMPORTANT: v7.3 deliberately preserves the v7.2 execution contract:
+#   - no hedge; opposite side closes and verifies before the new side opens
+#   - no duplicate same-side stacking by default
+#   - dynamic OANDA margin sizing and portfolio-slot ceiling behavior
+#   - MIN(balance, NAV) sizing equity
+#   - live spread hard ceiling (payload may tighten, never loosen)
+#   - serialized entry/flip processing
+#   - 5 PM America/New_York fresh-entry blackout
+#   - CLOSE actions are never blocked by spread/rollover logic
+#
+# v7.3 ADDITION ONLY: broker-confirmed accounting / reconciliation.
+# Every OANDA ORDER_FILL is captured from the broker response and written to a
+# SQLite audit ledger. Missing fills are recovered from OANDA's transaction API.
+# Ledger failures are NON-FATAL to trading: execution never depends on SQLite.
 #
 # Required Render environment variables:
 #   OANDA_ACCOUNT_ID
 #   OANDA_API_KEY
 #
-# Optional Render environment variables:
+# Existing optional Render environment variables (unchanged):
 #   OANDA_BASE_HOST=https://api-fxtrade.oanda.com
 #   TGIM_FORCE_DYNAMIC_SIZING=true
 #   TGIM_DEFAULT_RISK_PCT=75
 #   TGIM_MARGIN_SAFETY=0.95
 #   TGIM_ALLOW_ADD_SAME_SIDE=false
 #   TGIM_MARGIN_RETRY=2
-#   TGIM_MAX_SPREAD_PIPS=4          # hard block new entries/flips when live spread is > this value; 0/off disables
-#   TGIM_SPREAD_BUFFER_PIPS=0       # optional extra reserve in sizing math
+#   TGIM_MAX_SPREAD_PIPS=4
+#   TGIM_SPREAD_BUFFER_PIPS=0
 #   TGIM_PORTFOLIO_SLOT_MODE=true
 #   TGIM_MAX_PORTFOLIO_MARGIN_PCT=30
 #   TGIM_MAX_CONCURRENT_POSITIONS=3
 #   TGIM_BLOCK_NY_5PM_HOUR=true
 #   TGIM_RESPECT_PAYLOAD_RISK_PCT_IN_SLOT_MODE=false
 #
-# Main protections:
-#   1) No hedge: opposite side must close and verify before new side opens.
-#   2) No duplicate same-side stacking by default.
-#   3) Dynamic OANDA margin sizing per instrument using live marginRate.
-#   4) Live spread fetched from OANDA pricing endpoint and logged/returned.
-#   5) Optional max-spread blocker.
+# New optional ledger environment variables:
+#   TGIM_LEDGER_ENABLED=true
+#   TGIM_LEDGER_PATH=/var/data/tgim_oanda_ledger.sqlite3
+#       If unset, /var/data is used when available; otherwise /tmp is used.
+#       The ledger self-heals from OANDA if local storage is replaced on deploy.
+#   TGIM_LEDGER_LOOKBACK_DAYS=14
+#       Initial/self-heal broker-history backfill window.
+#   TGIM_LEDGER_RECONCILE_INTERVAL_SEC=300
+#       Minimum interval between opportunistic background reconciliations.
+#
+# Read-only audit endpoints:
+#   GET  /ledger?limit=100
+#   GET  /ledger/AUD_USD?limit=100
+#   GET  /ledger.csv?limit=500
+#   GET  /reconcile
+#   GET  /reconcile?full=1
+#
+# OANDA remains the source of truth. SQLite is a durable/local audit cache.
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import os
-import time
+import sqlite3
 import threading
-from zoneinfo import ZoneInfo
+import time
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP, getcontext
-from typing import Any, Dict, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import requests
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
 
 getcontext().prec = 28
 app = Flask(__name__)
@@ -61,6 +93,8 @@ OPEN_POSITIONS_URL = f"{BASE_URL}/openPositions"
 SUMMARY_URL = f"{BASE_URL}/summary"
 INSTRUMENTS_URL = f"{BASE_URL}/instruments"
 PRICING_URL = f"{BASE_URL}/pricing"
+TRANSACTIONS_URL = f"{BASE_URL}/transactions"
+TRANSACTIONS_SINCEID_URL = f"{TRANSACTIONS_URL}/sinceid"
 
 HEADERS = {
     "Authorization": f"Bearer {API_KEY}",
@@ -76,23 +110,43 @@ MARGIN_RETRY = int(os.environ.get("TGIM_MARGIN_RETRY", "2"))
 MAX_SPREAD_PIPS = Decimal(os.environ.get("TGIM_MAX_SPREAD_PIPS", "4"))
 SPREAD_BUFFER_PIPS = Decimal(os.environ.get("TGIM_SPREAD_BUFFER_PIPS", "0"))
 
-# v7.2 portfolio-slot architecture.
+# v7.2 portfolio-slot architecture — intentionally preserved.
 PORTFOLIO_SLOT_MODE = os.environ.get("TGIM_PORTFOLIO_SLOT_MODE", "true").strip().lower() == "true"
 MAX_PORTFOLIO_MARGIN_PCT = Decimal(os.environ.get("TGIM_MAX_PORTFOLIO_MARGIN_PCT", "30"))
 MAX_CONCURRENT_POSITIONS = max(1, int(os.environ.get("TGIM_MAX_CONCURRENT_POSITIONS", "3")))
 BLOCK_NY_5PM_HOUR = os.environ.get("TGIM_BLOCK_NY_5PM_HOUR", "true").strip().lower() == "true"
 NY_TZ = ZoneInfo("America/New_York")
 
-# The current Pine payload still sends risk_pct=1.8 because that number belongs to
-# its historical Strategy Tester model. In portfolio-slot mode the live backend is
-# authoritative and uses portfolio_cap / max_positions instead.
 RESPECT_PAYLOAD_RISK_PCT_IN_SLOT_MODE = (
     os.environ.get("TGIM_RESPECT_PAYLOAD_RISK_PCT_IN_SLOT_MODE", "false").strip().lower() == "true"
 )
 
-# Serialize entry/flip processing so simultaneous TradingView alerts cannot all size
-# from the same pre-trade marginAvailable snapshot.
+# v7.3 broker-ledger configuration.
+LEDGER_ENABLED = os.environ.get("TGIM_LEDGER_ENABLED", "true").strip().lower() == "true"
+LEDGER_LOOKBACK_DAYS = max(1, int(os.environ.get("TGIM_LEDGER_LOOKBACK_DAYS", "14")))
+LEDGER_RECONCILE_INTERVAL_SEC = max(
+    30, int(os.environ.get("TGIM_LEDGER_RECONCILE_INTERVAL_SEC", "300"))
+)
+
+
+def _default_ledger_path() -> str:
+    explicit = os.environ.get("TGIM_LEDGER_PATH", "").strip()
+    if explicit:
+        return explicit
+    persistent = Path("/var/data")
+    if persistent.exists() and os.access(str(persistent), os.W_OK):
+        return str(persistent / "tgim_oanda_ledger.sqlite3")
+    return "/tmp/tgim_oanda_ledger.sqlite3"
+
+
+LEDGER_PATH = _default_ledger_path()
+
+# Serialize entry/flip processing exactly as v7.2 did.
 ENTRY_LOCK = threading.RLock()
+# Ledger/reconciliation locks are separate so accounting can never gate execution.
+LEDGER_LOCK = threading.RLock()
+RECONCILE_LOCK = threading.Lock()
+_RECONCILE_STATE = {"last_attempt_monotonic": 0.0, "running": False}
 
 # ──────────────────────────────────────────────
 # Generic helpers
@@ -141,7 +195,6 @@ def instrument_parts(instrument: str) -> Tuple[str, str]:
 
 
 def pip_size(instrument: str) -> Decimal:
-    # JPY pairs generally quote one pip as 0.01. Most FX pairs quote one pip as 0.0001.
     _base, quote = instrument_parts(instrument)
     if quote == "JPY":
         return Decimal("0.01")
@@ -173,9 +226,9 @@ def response_json(response: requests.Response) -> Dict[str, Any]:
 def log_event(tag: str, payload: Any) -> None:
     print(f"\n===== {tag} =====")
     try:
-        print(json.dumps(payload, indent=2, ensure_ascii=False)[:5000])
+        print(json.dumps(payload, indent=2, ensure_ascii=False, default=str)[:7000])
     except Exception:
-        print(str(payload)[:5000])
+        print(str(payload)[:7000])
     print("====================\n")
 
 
@@ -190,21 +243,538 @@ def log_oanda_response(tag: str, response: requests.Response) -> Dict[str, Any]:
     print(f"\n🔹 [{tag}] Status: {response.status_code}")
     print("🔸 URL:", response.url)
     print("📦 Payload snippet:", str(req_body)[:1500])
-    print("📜 Response snippet:", json.dumps(body, ensure_ascii=False)[:3000])
+    print("📜 Response snippet:", json.dumps(body, ensure_ascii=False, default=str)[:4000])
     print("──────────────────────────────────────────────\n")
     return body
 
 
 def tv_response(payload: Dict[str, Any], status: int = 200):
-    # Keep TradingView alerts from pausing on broker/account issues; details live in payload.ok/result.
+    # Keep TradingView alerts from pausing on broker/account issues.
     return jsonify(payload), status
 
 
 def hard_error(payload: Dict[str, Any], status: int = 400):
     return jsonify(payload), status
 
+
 # ──────────────────────────────────────────────
-# OANDA read helpers
+# v7.3 broker-confirmed ledger
+# ──────────────────────────────────────────────
+def _ledger_connect() -> sqlite3.Connection:
+    path = Path(LEDGER_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path), timeout=10, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
+
+
+def init_ledger() -> None:
+    if not LEDGER_ENABLED:
+        return
+    with LEDGER_LOCK:
+        conn = _ledger_connect()
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS ledger_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS fill_transactions (
+                    transaction_id TEXT PRIMARY KEY,
+                    time TEXT,
+                    transaction_type TEXT,
+                    instrument TEXT,
+                    order_id TEXT,
+                    batch_id TEXT,
+                    units TEXT,
+                    direction TEXT,
+                    fill_price TEXT,
+                    full_vwap TEXT,
+                    pl TEXT,
+                    quote_pl TEXT,
+                    financing TEXT,
+                    commission TEXT,
+                    guaranteed_execution_fee TEXT,
+                    half_spread_cost TEXT,
+                    account_balance TEXT,
+                    reason TEXT,
+                    source TEXT,
+                    trade_opened_json TEXT,
+                    trades_closed_json TEXT,
+                    trade_reduced_json TEXT,
+                    raw_json TEXT NOT NULL,
+                    ingested_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_fill_instrument_time
+                ON fill_transactions(instrument, time DESC);
+
+                CREATE TABLE IF NOT EXISTS trade_events (
+                    event_key TEXT PRIMARY KEY,
+                    fill_transaction_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    instrument TEXT,
+                    time TEXT,
+                    trade_id TEXT,
+                    units TEXT,
+                    direction TEXT,
+                    price TEXT,
+                    realized_pl TEXT,
+                    financing TEXT,
+                    base_financing TEXT,
+                    quote_financing TEXT,
+                    guaranteed_execution_fee TEXT,
+                    half_spread_cost TEXT,
+                    initial_margin_required TEXT,
+                    source TEXT,
+                    raw_json TEXT NOT NULL,
+                    FOREIGN KEY(fill_transaction_id) REFERENCES fill_transactions(transaction_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_trade_events_instrument_time
+                ON trade_events(instrument, time DESC);
+                CREATE INDEX IF NOT EXISTS idx_trade_events_type_time
+                ON trade_events(event_type, time DESC);
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _meta_get(key: str) -> Optional[str]:
+    if not LEDGER_ENABLED:
+        return None
+    init_ledger()
+    with LEDGER_LOCK:
+        conn = _ledger_connect()
+        try:
+            row = conn.execute("SELECT value FROM ledger_meta WHERE key=?", (key,)).fetchone()
+            return str(row["value"]) if row else None
+        finally:
+            conn.close()
+
+
+def _meta_set(key: str, value: Any) -> None:
+    if not LEDGER_ENABLED:
+        return
+    init_ledger()
+    now = datetime.now(timezone.utc).isoformat()
+    with LEDGER_LOCK:
+        conn = _ledger_connect()
+        try:
+            conn.execute(
+                """INSERT INTO ledger_meta(key,value,updated_at) VALUES(?,?,?)
+                   ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
+                (key, str(value), now),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _direction_from_units(units: Any) -> str:
+    u = d(units, "0")
+    return "BUY" if u > 0 else "SELL" if u < 0 else "FLAT"
+
+
+def _json_text(value: Any) -> str:
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False, default=str)
+
+
+def _official_fill_price(tx: Dict[str, Any]) -> Optional[str]:
+    # OANDA documents the embedded TradeOpen/TradeReduce prices as official/exact.
+    opened = tx.get("tradeOpened")
+    if isinstance(opened, dict) and opened.get("price") is not None:
+        return str(opened.get("price"))
+    closed = tx.get("tradesClosed") or []
+    if isinstance(closed, list) and closed:
+        prices = [str(x.get("price")) for x in closed if isinstance(x, dict) and x.get("price") is not None]
+        if len(set(prices)) == 1 and prices:
+            return prices[0]
+    reduced = tx.get("tradeReduced")
+    if isinstance(reduced, dict) and reduced.get("price") is not None:
+        return str(reduced.get("price"))
+    return str(tx.get("fullVWAP") or tx.get("price") or "") or None
+
+
+def ingest_order_fill(tx: Dict[str, Any], source: str = "unknown") -> Dict[str, Any]:
+    """Idempotently store one broker ORDER_FILL and its trade-level events."""
+    if not LEDGER_ENABLED:
+        return {"ok": True, "enabled": False, "stored": False}
+    if not isinstance(tx, dict) or str(tx.get("type", "")).upper() != "ORDER_FILL":
+        return {"ok": False, "stored": False, "reason": "not_order_fill"}
+    txid = str(tx.get("id") or "").strip()
+    if not txid:
+        return {"ok": False, "stored": False, "reason": "missing_transaction_id"}
+
+    init_ledger()
+    now = datetime.now(timezone.utc).isoformat()
+    instrument = normalize(tx.get("instrument"))
+    units = str(tx.get("units", ""))
+    direction = _direction_from_units(units)
+    fill_price = _official_fill_price(tx)
+
+    trade_opened = tx.get("tradeOpened") if isinstance(tx.get("tradeOpened"), dict) else None
+    trades_closed = tx.get("tradesClosed") if isinstance(tx.get("tradesClosed"), list) else []
+    trade_reduced = tx.get("tradeReduced") if isinstance(tx.get("tradeReduced"), dict) else None
+
+    with LEDGER_LOCK:
+        conn = _ledger_connect()
+        try:
+            before = conn.total_changes
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO fill_transactions(
+                    transaction_id,time,transaction_type,instrument,order_id,batch_id,
+                    units,direction,fill_price,full_vwap,pl,quote_pl,financing,commission,
+                    guaranteed_execution_fee,half_spread_cost,account_balance,reason,source,
+                    trade_opened_json,trades_closed_json,trade_reduced_json,raw_json,ingested_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    txid,
+                    str(tx.get("time") or ""),
+                    str(tx.get("type") or ""),
+                    instrument,
+                    str(tx.get("orderID") or ""),
+                    str(tx.get("batchID") or ""),
+                    units,
+                    direction,
+                    fill_price,
+                    str(tx.get("fullVWAP") or ""),
+                    str(tx.get("pl") or "0"),
+                    str(tx.get("quotePL") or "0"),
+                    str(tx.get("financing") or "0"),
+                    str(tx.get("commission") or "0"),
+                    str(tx.get("guaranteedExecutionFee") or "0"),
+                    str(tx.get("halfSpreadCost") or "0"),
+                    str(tx.get("accountBalance") or ""),
+                    str(tx.get("reason") or ""),
+                    source,
+                    _json_text(trade_opened) if trade_opened else "",
+                    _json_text(trades_closed),
+                    _json_text(trade_reduced) if trade_reduced else "",
+                    _json_text(tx),
+                    now,
+                ),
+            )
+            inserted_fill = conn.total_changes > before
+
+            def store_event(event_type: str, obj: Dict[str, Any], idx: int = 0) -> None:
+                trade_id = str(obj.get("tradeID") or "")
+                event_key = f"{txid}:{event_type}:{trade_id}:{idx}"
+                event_units = str(obj.get("units") or "")
+                # For close/reduce, use transaction side as direction of the execution.
+                event_direction = direction if event_type in {"CLOSED", "REDUCED"} else _direction_from_units(event_units)
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO trade_events(
+                        event_key,fill_transaction_id,event_type,instrument,time,trade_id,units,
+                        direction,price,realized_pl,financing,base_financing,quote_financing,
+                        guaranteed_execution_fee,half_spread_cost,initial_margin_required,source,raw_json
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        event_key,
+                        txid,
+                        event_type,
+                        instrument,
+                        str(tx.get("time") or ""),
+                        trade_id,
+                        event_units,
+                        event_direction,
+                        str(obj.get("price") or ""),
+                        str(obj.get("realizedPL") or "0"),
+                        str(obj.get("financing") or "0"),
+                        str(obj.get("baseFinancing") or "0"),
+                        str(obj.get("quoteFinancing") or "0"),
+                        str(obj.get("guaranteedExecutionFee") or "0"),
+                        str(obj.get("halfSpreadCost") or "0"),
+                        str(obj.get("initialMarginRequired") or ""),
+                        source,
+                        _json_text(obj),
+                    ),
+                )
+
+            if trade_opened:
+                store_event("OPENED", trade_opened, 0)
+            for i, obj in enumerate(trades_closed):
+                if isinstance(obj, dict):
+                    store_event("CLOSED", obj, i)
+            if trade_reduced:
+                store_event("REDUCED", trade_reduced, 0)
+
+            conn.commit()
+        finally:
+            conn.close()
+
+    realized = sum((d(x.get("realizedPL"), "0") for x in trades_closed if isinstance(x, dict)), Decimal("0"))
+    if trade_reduced:
+        realized += d(trade_reduced.get("realizedPL"), "0")
+
+    result = {
+        "ok": True,
+        "stored": inserted_fill,
+        "transaction_id": txid,
+        "instrument": instrument,
+        "units": units,
+        "direction": direction,
+        "fill_price": fill_price,
+        "pl": str(tx.get("pl") or "0"),
+        "realized_pl_from_trade_events": str(realized),
+        "trades_closed": len(trades_closed),
+        "trade_reduced": bool(trade_reduced),
+        "trade_opened": bool(trade_opened),
+        "account_balance": str(tx.get("accountBalance") or ""),
+        "source": source,
+    }
+    if trades_closed or trade_reduced:
+        log_event("TGIM-BROKER-VERIFIED-CLOSE", result)
+    else:
+        log_event("TGIM-BROKER-VERIFIED-FILL", result)
+    return result
+
+
+def _walk_fill_transactions(obj: Any) -> Iterable[Dict[str, Any]]:
+    """Find ORDER_FILL objects in normal order/position-close OANDA responses."""
+    if isinstance(obj, dict):
+        if str(obj.get("type", "")).upper() == "ORDER_FILL" and obj.get("id") is not None:
+            yield obj
+        for key, value in obj.items():
+            # Avoid recursing into arbitrary stringified raw fields; normal dict/list only.
+            if isinstance(value, (dict, list)):
+                yield from _walk_fill_transactions(value)
+    elif isinstance(obj, list):
+        for value in obj:
+            if isinstance(value, (dict, list)):
+                yield from _walk_fill_transactions(value)
+
+
+def ingest_fills_from_oanda_response(body: Any, source: str) -> List[Dict[str, Any]]:
+    if not LEDGER_ENABLED:
+        return []
+    results: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    try:
+        for tx in _walk_fill_transactions(body):
+            txid = str(tx.get("id") or "")
+            if not txid or txid in seen:
+                continue
+            seen.add(txid)
+            results.append(ingest_order_fill(tx, source=source))
+    except Exception as exc:
+        # Accounting must never interfere with execution.
+        log_event("TGIM-LEDGER-INGEST-NONFATAL-ERROR", {"source": source, "error": repr(exc)})
+    return results
+
+
+def _oanda_get_transactions_since(last_id: str) -> Tuple[int, Dict[str, Any]]:
+    r = requests.get(
+        TRANSACTIONS_SINCEID_URL,
+        headers=HEADERS,
+        params={"id": str(last_id), "type": "ORDER_FILL"},
+        timeout=REQUEST_TIMEOUT,
+    )
+    body = response_json(r)
+    return r.status_code, body
+
+
+def _oanda_get_transaction_pages_since_time(from_time: str) -> Tuple[int, Dict[str, Any]]:
+    params = {
+        "from": from_time,
+        "to": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "pageSize": 1000,
+        "type": "ORDER_FILL",
+    }
+    r = requests.get(TRANSACTIONS_URL, headers=HEADERS, params=params, timeout=REQUEST_TIMEOUT)
+    return r.status_code, response_json(r)
+
+
+def _fetch_transaction_page(url: str) -> Tuple[int, Dict[str, Any]]:
+    r = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+    return r.status_code, response_json(r)
+
+
+def reconcile_transactions(force_full: bool = False) -> Dict[str, Any]:
+    """Recover missing ORDER_FILL records from OANDA without touching execution."""
+    if not LEDGER_ENABLED:
+        return {"ok": True, "enabled": False, "ingested": 0}
+
+    init_ledger()
+    if not RECONCILE_LOCK.acquire(blocking=False):
+        return {"ok": True, "skipped": True, "reason": "reconcile_already_running"}
+
+    started = time.monotonic()
+    try:
+        last_cursor = None if force_full else _meta_get("last_reconciled_transaction_id")
+        all_transactions: List[Dict[str, Any]] = []
+        last_transaction_id: Optional[str] = None
+        mode = "sinceid" if last_cursor else "lookback"
+
+        if last_cursor:
+            status, body = _oanda_get_transactions_since(last_cursor)
+            if status >= 300:
+                return {"ok": False, "mode": mode, "broker_status": status, "body": body}
+            all_transactions = [x for x in (body.get("transactions") or []) if isinstance(x, dict)]
+            last_transaction_id = str(body.get("lastTransactionID") or last_cursor)
+        else:
+            start_dt = datetime.now(timezone.utc) - timedelta(days=LEDGER_LOOKBACK_DAYS)
+            from_time = start_dt.isoformat().replace("+00:00", "Z")
+            status, body = _oanda_get_transaction_pages_since_time(from_time)
+            if status >= 300:
+                return {"ok": False, "mode": mode, "broker_status": status, "body": body}
+            last_transaction_id = str(body.get("lastTransactionID") or "") or None
+            pages = body.get("pages") or []
+            for page_url in pages:
+                pstatus, pbody = _fetch_transaction_page(str(page_url))
+                if pstatus >= 300:
+                    log_event(
+                        "TGIM-LEDGER-PAGE-NONFATAL-ERROR",
+                        {"status": pstatus, "url": page_url, "body": pbody},
+                    )
+                    continue
+                all_transactions.extend(
+                    x for x in (pbody.get("transactions") or []) if isinstance(x, dict)
+                )
+                if not last_transaction_id and pbody.get("lastTransactionID"):
+                    last_transaction_id = str(pbody.get("lastTransactionID"))
+
+        ingested = 0
+        duplicates = 0
+        closing_fills = 0
+        for tx in all_transactions:
+            if str(tx.get("type", "")).upper() != "ORDER_FILL":
+                continue
+            result = ingest_order_fill(tx, source=f"reconcile_{mode}")
+            if result.get("stored"):
+                ingested += 1
+            else:
+                duplicates += 1
+            if result.get("trades_closed", 0) or result.get("trade_reduced"):
+                closing_fills += 1
+
+        # Advance only after the broker query has been processed. lastTransactionID is
+        # OANDA's most recent account transaction ID, so subsequent sinceid is safe.
+        if last_transaction_id:
+            _meta_set("last_reconciled_transaction_id", last_transaction_id)
+        _meta_set("last_reconcile_utc", datetime.now(timezone.utc).isoformat())
+
+        result = {
+            "ok": True,
+            "mode": mode,
+            "force_full": force_full,
+            "cursor_before": last_cursor,
+            "cursor_after": last_transaction_id,
+            "broker_transactions_seen": len(all_transactions),
+            "new_fill_transactions_stored": ingested,
+            "duplicates_already_stored": duplicates,
+            "closing_fills_seen": closing_fills,
+            "lookback_days_if_full": LEDGER_LOOKBACK_DAYS,
+            "elapsed_sec": round(time.monotonic() - started, 3),
+        }
+        log_event("TGIM-LEDGER-RECONCILE", result)
+        return result
+    except requests.RequestException as exc:
+        return {"ok": False, "error": "oanda_request_exception", "detail": str(exc)}
+    except Exception as exc:
+        app.logger.exception("Ledger reconciliation failed")
+        return {"ok": False, "error": "reconcile_exception", "detail": repr(exc)}
+    finally:
+        RECONCILE_LOCK.release()
+        _RECONCILE_STATE["last_attempt_monotonic"] = time.monotonic()
+        _RECONCILE_STATE["running"] = False
+
+
+def safe_reconcile_async(reason: str = "opportunistic", force_full: bool = False) -> None:
+    """Background reconciliation; never blocks or changes a trading response."""
+    if not LEDGER_ENABLED:
+        return
+    now = time.monotonic()
+    if not force_full and now - float(_RECONCILE_STATE.get("last_attempt_monotonic", 0.0)) < LEDGER_RECONCILE_INTERVAL_SEC:
+        return
+    if _RECONCILE_STATE.get("running"):
+        return
+    _RECONCILE_STATE["running"] = True
+
+    def runner() -> None:
+        try:
+            result = reconcile_transactions(force_full=force_full)
+            if not result.get("ok", False):
+                log_event("TGIM-LEDGER-RECONCILE-NONFATAL-ERROR", {"reason": reason, "result": result})
+        except Exception as exc:
+            log_event("TGIM-LEDGER-BACKGROUND-NONFATAL-ERROR", {"reason": reason, "error": repr(exc)})
+        finally:
+            _RECONCILE_STATE["running"] = False
+
+    threading.Thread(target=runner, name="tgim-ledger-reconcile", daemon=True).start()
+
+
+def ledger_query(instrument: Optional[str] = None, limit: int = 100) -> Dict[str, Any]:
+    if not LEDGER_ENABLED:
+        return {"ok": True, "enabled": False, "rows": []}
+    init_ledger()
+    limit = max(1, min(int(limit), 2000))
+    where = "WHERE event_type IN ('CLOSED','REDUCED')"
+    params: List[Any] = []
+    if instrument:
+        where += " AND instrument=?"
+        params.append(normalize(instrument))
+    params.append(limit)
+
+    with LEDGER_LOCK:
+        conn = _ledger_connect()
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    event_type,instrument,time,trade_id,units,direction,price,
+                    realized_pl,financing,guaranteed_execution_fee,half_spread_cost,
+                    fill_transaction_id,source
+                FROM trade_events
+                {where}
+                ORDER BY time DESC, fill_transaction_id DESC
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+            summary = conn.execute(
+                f"""
+                SELECT COUNT(*) AS closed_events,
+                       COALESCE(SUM(CAST(realized_pl AS REAL)),0) AS realized_pl,
+                       COALESCE(SUM(CAST(financing AS REAL)),0) AS financing
+                FROM trade_events
+                {where.replace(' LIMIT ?', '') if False else where}
+                """,
+                tuple(params[:-1]),
+            ).fetchone()
+            fill_count = conn.execute("SELECT COUNT(*) AS n FROM fill_transactions").fetchone()["n"]
+        finally:
+            conn.close()
+
+    return {
+        "ok": True,
+        "enabled": True,
+        "instrument": normalize(instrument) if instrument else None,
+        "ledger_path": LEDGER_PATH,
+        "last_reconciled_transaction_id": _meta_get("last_reconciled_transaction_id"),
+        "last_reconcile_utc": _meta_get("last_reconcile_utc"),
+        "fill_transaction_count": int(fill_count),
+        "closed_event_count": int(summary["closed_events"] or 0),
+        "realized_pl_sum": str(summary["realized_pl"] or 0),
+        "financing_sum": str(summary["financing"] or 0),
+        "rows": [dict(r) for r in rows],
+    }
+
+
+# ──────────────────────────────────────────────
+# OANDA read helpers — v7.2 behavior preserved
 # ──────────────────────────────────────────────
 def get_account_summary() -> Tuple[int, Dict[str, Any]]:
     r = requests.get(SUMMARY_URL, headers=HEADERS, timeout=REQUEST_TIMEOUT)
@@ -269,7 +839,7 @@ def get_instrument_details(instrument: str) -> Tuple[int, Dict[str, Any]]:
     }
 
 
-def get_pricing(instruments: list[str]) -> Tuple[int, Dict[str, Any]]:
+def get_pricing(instruments: List[str]) -> Tuple[int, Dict[str, Any]]:
     params = {"instruments": ",".join(instruments), "includeHomeConversions": "true"}
     r = requests.get(PRICING_URL, headers=HEADERS, params=params, timeout=REQUEST_TIMEOUT)
     body = log_oanda_response("OANDA-PRICING", r)
@@ -285,14 +855,12 @@ def best_bid_ask(price_obj: Dict[str, Any]) -> Tuple[Decimal, Decimal]:
 
 
 def extract_quote_to_home_conversion(price_obj: Dict[str, Any], quote_ccy: str, home_ccy: str) -> Decimal:
-    # Most reliable when includeHomeConversions=true. Different OANDA responses can expose conversion factors in slightly different shapes.
     if quote_ccy == home_ccy:
         return Decimal("1")
     convs = price_obj.get("homeConversions") or []
     for c in convs:
         ccy = str(c.get("currency", "")).upper()
         if ccy == quote_ccy:
-            # For margin reserve, use a conservative factor. Prefer positive ask, then bid, then factor.
             for k in ("accountGain", "accountLoss", "positionValue", "ask", "bid", "factor"):
                 val = d(c.get(k), "0")
                 if val > 0:
@@ -315,7 +883,7 @@ def get_market_snapshot(instrument: str, account_currency: str = "USD") -> Tuple
     spread_price = ask - bid
     pip = pip_size(instrument)
     spread_pips = spread_price / pip if pip > 0 else Decimal("0")
-    base, quote = instrument_parts(instrument)
+    _base, quote = instrument_parts(instrument)
     quote_to_home = extract_quote_to_home_conversion(p, quote, str(account_currency or "USD").upper())
     return 200, {
         "ok": True,
@@ -356,11 +924,23 @@ def get_position(instrument: str) -> Tuple[bool, int, int, Optional[Dict[str, An
 
 def snapshot_position(instrument: str) -> Dict[str, Any]:
     found, long_units, short_units_abs, raw, err = get_position(instrument)
-    return {"instrument": instrument, "found": found, "long_units": long_units, "short_units": short_units_abs, "raw": raw, "error": err}
+    return {
+        "instrument": instrument,
+        "found": found,
+        "long_units": long_units,
+        "short_units": short_units_abs,
+        "raw": raw,
+        "error": err,
+    }
+
 
 # ──────────────────────────────────────────────
-# Portfolio-slot / rollover helpers
+# Portfolio-slot / rollover helpers — v7.2 preserved
 # ──────────────────────────────────────────────
+def datetime_now_ny():
+    return datetime.now(NY_TZ)
+
+
 def ny_rollover_blocked_now() -> Tuple[bool, str]:
     if not BLOCK_NY_5PM_HOUR:
         return False, ""
@@ -368,12 +948,6 @@ def ny_rollover_blocked_now() -> Tuple[bool, str]:
     if now_ny.hour == 17:
         return True, now_ny.isoformat()
     return False, now_ny.isoformat()
-
-
-def datetime_now_ny():
-    # Isolated for deterministic testing / monkeypatching.
-    from datetime import datetime
-    return datetime.now(NY_TZ)
 
 
 def portfolio_budget(acct: Dict[str, Any], payload_risk_pct: Decimal) -> Dict[str, Any]:
@@ -396,7 +970,6 @@ def portfolio_budget(acct: Dict[str, Any], payload_risk_pct: Decimal) -> Dict[st
         slot_pct = min(slot_pct, payload_risk_pct)
     slot_target = sizing_equity * slot_pct / Decimal("100")
 
-    # Never consume more than portfolio headroom or safely available OANDA margin.
     broker_available_safe = max(Decimal("0"), margin_available * MARGIN_SAFETY)
     margin_to_use = min(slot_target, remaining_under_cap, broker_available_safe)
 
@@ -419,13 +992,13 @@ def portfolio_budget(acct: Dict[str, Any], payload_risk_pct: Decimal) -> Dict[st
 
 
 # ──────────────────────────────────────────────
-# Dynamic sizing
+# Dynamic sizing — v7.2 preserved
 # ──────────────────────────────────────────────
 def dynamic_units_for_instrument(
     instrument: str,
     risk_pct: Decimal,
     side: str,
-    max_spread_pips_override: Optional[Decimal] = None
+    max_spread_pips_override: Optional[Decimal] = None,
 ) -> Tuple[int, Dict[str, Any]]:
     acct_status, acct = get_account_snapshot()
     if acct_status >= 300 or not acct.get("ok"):
@@ -441,8 +1014,6 @@ def dynamic_units_for_instrument(
         raise RuntimeError(f"market_snapshot_failed: {mkt}")
 
     spread_pips = d(mkt.get("spreadPips"), "0")
-
-    # Environment value is a hard ceiling. Payload may tighten it, never loosen it.
     payload_max = max_spread_pips_override if max_spread_pips_override is not None else Decimal("0")
     env_max = MAX_SPREAD_PIPS
     if env_max > 0 and payload_max > 0:
@@ -453,9 +1024,7 @@ def dynamic_units_for_instrument(
         effective_max_spread_pips = payload_max
 
     if effective_max_spread_pips > 0 and spread_pips > effective_max_spread_pips:
-        raise RuntimeError(
-            f"spread_too_wide: spread_pips={spread_pips} max={effective_max_spread_pips}"
-        )
+        raise RuntimeError(f"spread_too_wide: spread_pips={spread_pips} max={effective_max_spread_pips}")
 
     margin_rate = d(inst.get("marginRate"), "0")
     quote_to_home = d(mkt.get("quoteToHomeConversion"), "1")
@@ -469,14 +1038,12 @@ def dynamic_units_for_instrument(
         budget = portfolio_budget(acct, risk_pct)
         if budget["openPositionCount"] >= MAX_CONCURRENT_POSITIONS:
             raise RuntimeError(
-                f"max_concurrent_positions_reached: "
-                f"{budget['openPositionCount']}/{MAX_CONCURRENT_POSITIONS}"
+                f"max_concurrent_positions_reached: {budget['openPositionCount']}/{MAX_CONCURRENT_POSITIONS}"
             )
         margin_to_use = budget["marginToUse"]
         if margin_to_use <= 0:
             raise RuntimeError(
-                f"portfolio_margin_cap_reached: used={budget['marginUsed']} "
-                f"cap={budget['portfolioCapAmount']}"
+                f"portfolio_margin_cap_reached: used={budget['marginUsed']} cap={budget['portfolioCapAmount']}"
             )
         effective_risk_pct = budget["slotTargetPct"]
     else:
@@ -562,20 +1129,19 @@ def choose_units(data: Dict[str, Any], instrument: str, action: str) -> Tuple[in
     risk_pct = d(data.get("risk_pct", data.get("riskPct", DEFAULT_RISK_PCT)), str(DEFAULT_RISK_PCT))
     max_spread_raw = data.get("max_spread_pips", data.get("maxSpreadPips", None))
     max_spread_pips_override = None if max_spread_raw in (None, "") else d(max_spread_raw, "0")
-    use_dynamic = FORCE_DYNAMIC_SIZING or sizing_mode in {"percent_equity", "dynamic_margin", "margin", "account_percent"}
+    # Exact v7.2 mode set preserved. FORCE_DYNAMIC_SIZING remains authoritative when enabled.
+    use_dynamic = FORCE_DYNAMIC_SIZING or sizing_mode in {
+        "percent_equity", "dynamic_margin", "margin", "account_percent"
+    }
     if use_dynamic:
-        return dynamic_units_for_instrument(instrument, risk_pct, action, max_spread_pips_override=max_spread_pips_override)
+        return dynamic_units_for_instrument(
+            instrument, risk_pct, action, max_spread_pips_override=max_spread_pips_override
+        )
     units = to_int_units(data.get("units"))
     return units, {"mode": "payload_units", "finalUnits": units, "payloadUnits": data.get("units")}
 
 
 def enforce_entry_spread_guard(data: Dict[str, Any], instrument: str) -> Dict[str, Any]:
-    """Hard broker-side entry/flip spread lock.
-
-    This runs before opening any new position, even when fixed units are used.
-    Close actions intentionally bypass it so the bot can always reduce/flatten risk.
-    Payload max_spread_pips overrides the Render env value when supplied.
-    """
     max_spread_raw = data.get("max_spread_pips", data.get("maxSpreadPips", None))
     payload_max = Decimal("0") if max_spread_raw in (None, "") else d(max_spread_raw, "0")
     if MAX_SPREAD_PIPS > 0 and payload_max > 0:
@@ -588,15 +1154,47 @@ def enforce_entry_spread_guard(data: Dict[str, Any], instrument: str) -> Dict[st
     acct_ccy = acct.get("currency", "USD") if acct_status < 300 and acct.get("ok") else "USD"
     mkt_status, mkt = get_market_snapshot(instrument, acct_ccy)
     if mkt_status >= 300 or not mkt.get("ok"):
-        return {"ok": False, "blocked": True, "reason": "spread_check_failed", "broker_status": mkt_status, "maxSpreadPipsEffective": str(effective_max), "market": mkt}
+        return {
+            "ok": False,
+            "blocked": True,
+            "reason": "spread_check_failed",
+            "broker_status": mkt_status,
+            "maxSpreadPipsEffective": str(effective_max),
+            "market": mkt,
+        }
     spread_pips = d(mkt.get("spreadPips"), "0")
     if effective_max > 0 and spread_pips > effective_max:
-        return {"ok": False, "blocked": True, "reason": "spread_too_wide", "spreadPips": str(spread_pips), "maxSpreadPipsEffective": str(effective_max), "market": mkt}
-    return {"ok": True, "blocked": False, "spreadPips": str(spread_pips), "maxSpreadPipsEffective": str(effective_max), "market": mkt}
+        return {
+            "ok": False,
+            "blocked": True,
+            "reason": "spread_too_wide",
+            "spreadPips": str(spread_pips),
+            "maxSpreadPipsEffective": str(effective_max),
+            "market": mkt,
+        }
+    return {
+        "ok": True,
+        "blocked": False,
+        "spreadPips": str(spread_pips),
+        "maxSpreadPipsEffective": str(effective_max),
+        "market": mkt,
+    }
+
 
 # ──────────────────────────────────────────────
-# OANDA write helpers
+# OANDA write helpers + v7.3 immediate fill capture
 # ──────────────────────────────────────────────
+def _safe_capture_response_fills(body: Any, source: str) -> List[Dict[str, Any]]:
+    try:
+        results = ingest_fills_from_oanda_response(body, source=source)
+        safe_reconcile_async(reason=source)
+        return results
+    except Exception as exc:
+        # NEVER convert an accounting failure into a trading failure.
+        log_event("TGIM-LEDGER-NONFATAL-ERROR", {"source": source, "error": repr(exc)})
+        return []
+
+
 def place_market_order(instrument: str, signed_units: int) -> Tuple[int, Dict[str, Any]]:
     payload = {
         "order": {
@@ -609,6 +1207,11 @@ def place_market_order(instrument: str, signed_units: int) -> Tuple[int, Dict[st
     }
     r = requests.post(ORDERS_URL, headers=HEADERS, json=payload, timeout=REQUEST_TIMEOUT)
     body = log_oanda_response("OANDA-ORDER", r)
+    if r.status_code < 300:
+        ledger_capture = _safe_capture_response_fills(body, source="market_order_response")
+        if ledger_capture:
+            body = dict(body)
+            body["tgimLedger"] = ledger_capture
     return r.status_code, body
 
 
@@ -625,11 +1228,28 @@ def close_position(instrument: str, side: str, ignore_if_flat: bool = True) -> T
     if pos_err:
         return pos_err["status"], {"ok": False, "stage": "position_check_before_close", "error": pos_err}
 
-    has_side = (human_side == "long" and long_units > 0) or (human_side == "short" and short_units_abs > 0)
+    has_side = (human_side == "long" and long_units > 0) or (
+        human_side == "short" and short_units_abs > 0
+    )
     if not has_side:
         if ignore_if_flat:
-            return 200, {"ok": True, "ignored": True, "reason": "already_flat_or_no_matching_side", "instrument": instrument, "side": human_side, "long_units": long_units, "short_units": short_units_abs}
-        return 409, {"ok": False, "error": "no_matching_position_to_close", "instrument": instrument, "side": human_side, "long_units": long_units, "short_units": short_units_abs}
+            return 200, {
+                "ok": True,
+                "ignored": True,
+                "reason": "already_flat_or_no_matching_side",
+                "instrument": instrument,
+                "side": human_side,
+                "long_units": long_units,
+                "short_units": short_units_abs,
+            }
+        return 409, {
+            "ok": False,
+            "error": "no_matching_position_to_close",
+            "instrument": instrument,
+            "side": human_side,
+            "long_units": long_units,
+            "short_units": short_units_abs,
+        }
 
     url = f"{POSITIONS_URL}/{instrument}/close"
     payload = {close_field: "ALL"}
@@ -638,25 +1258,88 @@ def close_position(instrument: str, side: str, ignore_if_flat: bool = True) -> T
     if r.status_code >= 300:
         return r.status_code, {"ok": False, "stage": "close_position", "oanda": body}
 
+    # Capture broker P/L BEFORE any verification network call. OANDA's close response
+    # contains longOrderFillTransaction/shortOrderFillTransaction with realizedPL.
+    ledger_capture = _safe_capture_response_fills(body, source=f"close_{human_side}_response")
+
     time.sleep(0.15)
     found2, long2, short2, raw2, err2 = get_position(instrument)
     if err2:
-        return err2["status"], {"ok": False, "stage": "verify_close", "error": err2, "close_response": body}
-    still_open = (human_side == "long" and long2 > 0) or (human_side == "short" and short2 > 0)
+        return err2["status"], {
+            "ok": False,
+            "stage": "verify_close",
+            "error": err2,
+            "close_response": body,
+            "tgimLedger": ledger_capture,
+        }
+    still_open = (human_side == "long" and long2 > 0) or (
+        human_side == "short" and short2 > 0
+    )
     if still_open:
-        return 409, {"ok": False, "stage": "verify_close", "error": "side_still_open_after_close", "instrument": instrument, "side": human_side, "long_units": long2, "short_units": short2, "close_response": body, "position_after_close": raw2}
+        return 409, {
+            "ok": False,
+            "stage": "verify_close",
+            "error": "side_still_open_after_close",
+            "instrument": instrument,
+            "side": human_side,
+            "long_units": long2,
+            "short_units": short2,
+            "close_response": body,
+            "position_after_close": raw2,
+            "tgimLedger": ledger_capture,
+        }
 
-    return 200, {"ok": True, "instrument": instrument, "side": human_side, "closed": True, "oanda": body, "position_after_close": {"found": found2, "long_units": long2, "short_units": short2}}
+    # Small concise close summary for Render logs / webhook response.
+    close_summary = []
+    for item in ledger_capture:
+        if item.get("trades_closed", 0) or item.get("trade_reduced"):
+            close_summary.append(
+                {
+                    "transaction_id": item.get("transaction_id"),
+                    "instrument": item.get("instrument"),
+                    "units": item.get("units"),
+                    "fill_price": item.get("fill_price"),
+                    "realized_pl": item.get("realized_pl_from_trade_events"),
+                    "account_balance": item.get("account_balance"),
+                    "broker_verified": True,
+                }
+            )
+
+    return 200, {
+        "ok": True,
+        "instrument": instrument,
+        "side": human_side,
+        "closed": True,
+        "oanda": body,
+        "tgimLedger": ledger_capture,
+        "brokerVerifiedClose": close_summary,
+        "position_after_close": {
+            "found": found2,
+            "long_units": long2,
+            "short_units": short2,
+        },
+    }
 
 
-def strict_synced_entry(action: str, instrument: str, units: int, sizing: Dict[str, Any], policy: str = "sync") -> Tuple[int, Dict[str, Any]]:
+def strict_synced_entry(
+    action: str,
+    instrument: str,
+    units: int,
+    sizing: Dict[str, Any],
+    policy: str = "sync",
+) -> Tuple[int, Dict[str, Any]]:
     action_norm = str(action or "").lower().strip()
     if action_norm not in {"buy", "sell"}:
         return 400, {"ok": False, "error": "bad_entry_action", "action": action}
 
     before = snapshot_position(instrument)
     if before.get("error"):
-        return before["error"]["status"], {"ok": False, "stage": "pre_entry_position_check", "position": before, "sizing": sizing}
+        return before["error"]["status"], {
+            "ok": False,
+            "stage": "pre_entry_position_check",
+            "position": before,
+            "sizing": sizing,
+        }
 
     opposite_side = "short" if action_norm == "buy" else "long"
     same_side = "long" if action_norm == "buy" else "short"
@@ -664,26 +1347,64 @@ def strict_synced_entry(action: str, instrument: str, units: int, sizing: Dict[s
     same_units = before["long_units"] if action_norm == "buy" else before["short_units"]
 
     if same_units > 0 and not ALLOW_ADD_SAME_SIDE:
-        return 200, {"ok": True, "ignored": True, "reason": "same_side_position_already_open_no_stacking", "action_requested": action_norm, "instrument": instrument, "same_side": same_side, "same_units_before": same_units, "position_before": before, "sizing": sizing}
+        return 200, {
+            "ok": True,
+            "ignored": True,
+            "reason": "same_side_position_already_open_no_stacking",
+            "action_requested": action_norm,
+            "instrument": instrument,
+            "same_side": same_side,
+            "same_units_before": same_units,
+            "position_before": before,
+            "sizing": sizing,
+        }
 
     close_status = None
     close_body = None
     if str(policy or "sync").lower().strip() == "sync" and opposite_units > 0:
         close_status, close_body = close_position(instrument, opposite_side, ignore_if_flat=False)
         if close_status >= 300 or not close_body.get("ok", False):
-            return 409, {"ok": False, "blocked_new_entry": True, "reason": "opposite_close_failed_no_hedge_enforced", "action_requested": action_norm, "instrument": instrument, "units_requested": units, "opposite_side": opposite_side, "opposite_units_before": opposite_units, "position_before": before, "close_attempt": {"broker_status": close_status, "body": close_body}, "sizing": sizing}
+            return 409, {
+                "ok": False,
+                "blocked_new_entry": True,
+                "reason": "opposite_close_failed_no_hedge_enforced",
+                "action_requested": action_norm,
+                "instrument": instrument,
+                "units_requested": units,
+                "opposite_side": opposite_side,
+                "opposite_units_before": opposite_units,
+                "position_before": before,
+                "close_attempt": {"broker_status": close_status, "body": close_body},
+                "sizing": sizing,
+            }
 
     verified = snapshot_position(instrument)
     if verified.get("error"):
-        return verified["error"]["status"], {"ok": False, "stage": "verify_before_entry", "position": verified, "sizing": sizing}
+        return verified["error"]["status"], {
+            "ok": False,
+            "stage": "verify_before_entry",
+            "position": verified,
+            "sizing": sizing,
+        }
     verified_opposite_units = verified["short_units"] if action_norm == "buy" else verified["long_units"]
     if verified_opposite_units > 0:
-        return 409, {"ok": False, "blocked_new_entry": True, "reason": "opposite_position_still_exists_before_entry", "action_requested": action_norm, "instrument": instrument, "opposite_side": opposite_side, "opposite_units": verified_opposite_units, "position_before": before, "position_verified": verified, "close_attempt": {"broker_status": close_status, "body": close_body}, "sizing": sizing}
+        return 409, {
+            "ok": False,
+            "blocked_new_entry": True,
+            "reason": "opposite_position_still_exists_before_entry",
+            "action_requested": action_norm,
+            "instrument": instrument,
+            "opposite_side": opposite_side,
+            "opposite_units": verified_opposite_units,
+            "position_before": before,
+            "position_verified": verified,
+            "close_attempt": {"broker_status": close_status, "body": close_body},
+            "sizing": sizing,
+        }
 
     signed_units = units if action_norm == "buy" else -units
     order_status, order_body = place_market_order(instrument, signed_units)
 
-    # Retry margin rejection with smaller units.
     attempts = [{"units": signed_units, "broker_status": order_status, "body": order_body}]
     retry_units = abs(signed_units)
     retries_left = max(0, MARGIN_RETRY)
@@ -699,46 +1420,86 @@ def strict_synced_entry(action: str, instrument: str, units: int, sizing: Dict[s
         signed_units = signed_retry
 
     after = snapshot_position(instrument)
-    return order_status, {"ok": order_status < 300, "action": action_norm, "instrument": instrument, "units": signed_units, "policy": policy, "position_before": before, "opposite_close": {"broker_status": close_status, "body": close_body}, "order_attempts": attempts, "order": {"broker_status": order_status, "body": order_body}, "position_after": after, "sizing": sizing}
+    return order_status, {
+        "ok": order_status < 300,
+        "action": action_norm,
+        "instrument": instrument,
+        "units": signed_units,
+        "policy": policy,
+        "position_before": before,
+        "opposite_close": {"broker_status": close_status, "body": close_body},
+        "order_attempts": attempts,
+        "order": {"broker_status": order_status, "body": order_body},
+        "position_after": after,
+        "sizing": sizing,
+    }
 
 
 def close_all(instrument: str, ignore_if_flat: bool = True) -> Dict[str, Any]:
     long_status, long_body = close_position(instrument, "long", ignore_if_flat=ignore_if_flat)
     short_status, short_body = close_position(instrument, "short", ignore_if_flat=ignore_if_flat)
-    return {"ok": long_status < 300 and short_status < 300, "instrument": instrument, "long_close": {"broker_status": long_status, "body": long_body}, "short_close": {"broker_status": short_status, "body": short_body}}
+    return {
+        "ok": long_status < 300 and short_status < 300,
+        "instrument": instrument,
+        "long_close": {"broker_status": long_status, "body": long_body},
+        "short_close": {"broker_status": short_status, "body": short_body},
+    }
+
 
 # ──────────────────────────────────────────────
 # Routes
 # ──────────────────────────────────────────────
 @app.route("/", methods=["GET", "HEAD"])
 def root():
-    return jsonify({
-        "ok": True,
-        "service": "TGIM OANDA Dynamic Margin + Spread Webhook v7.2 — Portfolio Slot + Rollover Lock",
-        "route": "/webhook",
-        "dynamic_margin_sizing": True,
-        "force_dynamic_sizing": FORCE_DYNAMIC_SIZING,
-        "default_risk_pct": str(DEFAULT_RISK_PCT),
-        "margin_safety": str(MARGIN_SAFETY),
-        "max_spread_pips_env": str(MAX_SPREAD_PIPS),
-        "max_spread_payload_override": True,
-        "hard_entry_spread_lock": True,
-        "spread_buffer_pips": str(SPREAD_BUFFER_PIPS),
-        "no_hedge_enforced": True,
-        "portfolio_slot_mode": PORTFOLIO_SLOT_MODE,
-        "max_portfolio_margin_pct": str(MAX_PORTFOLIO_MARGIN_PCT),
-        "max_concurrent_positions": MAX_CONCURRENT_POSITIONS,
-        "default_slot_margin_pct": str(MAX_PORTFOLIO_MARGIN_PCT / Decimal(MAX_CONCURRENT_POSITIONS)),
-        "sizing_equity": "MIN(balance,NAV)",
-        "ny_5pm_entry_blackout": BLOCK_NY_5PM_HOUR,
-        "serialized_entry_processing": True,
-        "payload_risk_pct_is_historical_only_in_slot_mode": not RESPECT_PAYLOAD_RISK_PCT_IN_SLOT_MODE,
-    })
+    # Render health checks normally hit this. Kick a non-blocking broker-history heal.
+    safe_reconcile_async(reason="root_healthcheck")
+    return jsonify(
+        {
+            "ok": True,
+            "service": "TGIM OANDA Dynamic Margin + Spread Webhook v7.3 — Broker Ledger + Reconcile",
+            "route": "/webhook",
+            "dynamic_margin_sizing": True,
+            "force_dynamic_sizing": FORCE_DYNAMIC_SIZING,
+            "default_risk_pct": str(DEFAULT_RISK_PCT),
+            "margin_safety": str(MARGIN_SAFETY),
+            "max_spread_pips_env": str(MAX_SPREAD_PIPS),
+            "max_spread_payload_override": True,
+            "hard_entry_spread_lock": True,
+            "spread_buffer_pips": str(SPREAD_BUFFER_PIPS),
+            "no_hedge_enforced": True,
+            "portfolio_slot_mode": PORTFOLIO_SLOT_MODE,
+            "max_portfolio_margin_pct": str(MAX_PORTFOLIO_MARGIN_PCT),
+            "max_concurrent_positions": MAX_CONCURRENT_POSITIONS,
+            "default_slot_margin_pct": str(MAX_PORTFOLIO_MARGIN_PCT / Decimal(MAX_CONCURRENT_POSITIONS)),
+            "sizing_equity": "MIN(balance,NAV)",
+            "ny_5pm_entry_blackout": BLOCK_NY_5PM_HOUR,
+            "serialized_entry_processing": True,
+            "payload_risk_pct_is_historical_only_in_slot_mode": not RESPECT_PAYLOAD_RISK_PCT_IN_SLOT_MODE,
+            "broker_ledger": {
+                "enabled": LEDGER_ENABLED,
+                "path": LEDGER_PATH,
+                "lookback_days": LEDGER_LOOKBACK_DAYS,
+                "ledger_endpoint": "/ledger",
+                "csv_endpoint": "/ledger.csv",
+                "reconcile_endpoint": "/reconcile",
+                "execution_dependency": False,
+            },
+        }
+    )
 
 
 @app.route("/webhook", methods=["GET", "HEAD"])
 def webhook_get():
-    return jsonify({"ok": True, "route": "/webhook", "expect": "POST JSON", "service": "v7.2", "spread_endpoint": "/spread/<instrument>"})
+    return jsonify(
+        {
+            "ok": True,
+            "route": "/webhook",
+            "expect": "POST JSON",
+            "service": "v7.3",
+            "spread_endpoint": "/spread/<instrument>",
+            "ledger_endpoint": "/ledger",
+        }
+    )
 
 
 @app.route("/spread/<instrument>", methods=["GET"])
@@ -756,9 +1517,81 @@ def status_route(instrument: str):
     acct_status, acct = get_account_snapshot()
     acct_ccy = acct.get("currency", "USD") if acct_status < 300 and acct.get("ok") else "USD"
     mkt_status, mkt = get_market_snapshot(inst, acct_ccy)
-    inst_status, details = get_instrument_details(inst)
+    _inst_status, details = get_instrument_details(inst)
     pos = snapshot_position(inst)
-    return tv_response({"ok": True, "instrument": inst, "account": acct, "instrumentDetails": details, "market": mkt, "position": pos})
+    return tv_response(
+        {
+            "ok": True,
+            "instrument": inst,
+            "account": acct,
+            "instrumentDetails": details,
+            "market": mkt,
+            "position": pos,
+        }
+    )
+
+
+@app.route("/ledger", methods=["GET"])
+def ledger_route():
+    safe_reconcile_async(reason="ledger_view")
+    try:
+        limit = int(request.args.get("limit", "100"))
+    except ValueError:
+        limit = 100
+    return jsonify(ledger_query(limit=limit))
+
+
+@app.route("/ledger/<instrument>", methods=["GET"])
+def ledger_instrument_route(instrument: str):
+    safe_reconcile_async(reason="ledger_instrument_view")
+    try:
+        limit = int(request.args.get("limit", "100"))
+    except ValueError:
+        limit = 100
+    return jsonify(ledger_query(instrument=instrument, limit=limit))
+
+
+@app.route("/ledger.csv", methods=["GET"])
+def ledger_csv_route():
+    safe_reconcile_async(reason="ledger_csv")
+    try:
+        limit = int(request.args.get("limit", "500"))
+    except ValueError:
+        limit = 500
+    instrument = request.args.get("instrument")
+    data = ledger_query(instrument=instrument, limit=limit)
+    output = io.StringIO()
+    fields = [
+        "event_type",
+        "instrument",
+        "time",
+        "trade_id",
+        "units",
+        "direction",
+        "price",
+        "realized_pl",
+        "financing",
+        "guaranteed_execution_fee",
+        "half_spread_cost",
+        "fill_transaction_id",
+        "source",
+    ]
+    writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    for row in data.get("rows", []):
+        writer.writerow(row)
+    return Response(
+        output.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment; filename=tgim_oanda_broker_ledger.csv"},
+    )
+
+
+@app.route("/reconcile", methods=["GET", "POST"])
+def reconcile_route():
+    force_full = parse_bool(request.args.get("full"), default=False)
+    result = reconcile_transactions(force_full=force_full)
+    return jsonify(result), 200
 
 
 @app.route("/webhook", methods=["POST"])
@@ -783,29 +1616,61 @@ def webhook():
         if action == "status":
             acct_status, acct = get_account_snapshot()
             acct_ccy = acct.get("currency", "USD") if acct_status < 300 and acct.get("ok") else "USD"
-            mkt_status, mkt = get_market_snapshot(instrument, acct_ccy)
-            details_status, details = get_instrument_details(instrument)
+            _mkt_status, mkt = get_market_snapshot(instrument, acct_ccy)
+            _details_status, details = get_instrument_details(instrument)
             pos = snapshot_position(instrument)
-            return tv_response({"ok": True, "action": action, "instrument": instrument, "account": acct, "instrumentDetails": details, "market": mkt, "position": pos})
+            return tv_response(
+                {
+                    "ok": True,
+                    "action": action,
+                    "instrument": instrument,
+                    "account": acct,
+                    "instrumentDetails": details,
+                    "market": mkt,
+                    "position": pos,
+                }
+            )
 
         if action == "spread":
             acct_status, acct = get_account_snapshot()
             acct_ccy = acct.get("currency", "USD") if acct_status < 300 and acct.get("ok") else "USD"
             mkt_status, mkt = get_market_snapshot(instrument, acct_ccy)
-            return tv_response({"ok": mkt_status < 300, "action": action, "instrument": instrument, "broker_status": mkt_status, "spread": mkt})
+            return tv_response(
+                {
+                    "ok": mkt_status < 300,
+                    "action": action,
+                    "instrument": instrument,
+                    "broker_status": mkt_status,
+                    "spread": mkt,
+                }
+            )
 
+        # CLOSE routes intentionally bypass spread and 5PM guards, exactly as v7.2.
         if action == "close_buy":
             status, body = close_position(instrument, "long", ignore_if_flat=ignore_if_flat)
-            return tv_response({"ok": status < 300, "action": action, "instrument": instrument, "broker_status": status, "result": body})
+            return tv_response(
+                {"ok": status < 300, "action": action, "instrument": instrument, "broker_status": status, "result": body}
+            )
 
         if action == "close_sell":
             status, body = close_position(instrument, "short", ignore_if_flat=ignore_if_flat)
-            return tv_response({"ok": status < 300, "action": action, "instrument": instrument, "broker_status": status, "result": body})
+            return tv_response(
+                {"ok": status < 300, "action": action, "instrument": instrument, "broker_status": status, "result": body}
+            )
 
         if action == "close":
             side = data.get("side") or data.get("target")
             status, body = close_position(instrument, str(side), ignore_if_flat=ignore_if_flat)
-            return tv_response({"ok": status < 300, "action": action, "instrument": instrument, "side": side, "broker_status": status, "result": body})
+            return tv_response(
+                {
+                    "ok": status < 300,
+                    "action": action,
+                    "instrument": instrument,
+                    "side": side,
+                    "broker_status": status,
+                    "result": body,
+                }
+            )
 
         if action == "close_all":
             body = close_all(instrument, ignore_if_flat=ignore_if_flat)
@@ -814,36 +1679,72 @@ def webhook():
         if action in {"buy", "sell"}:
             rollover_blocked, ny_now = ny_rollover_blocked_now()
             if rollover_blocked:
-                return tv_response({
-                    "ok": False, "action": action, "instrument": instrument,
-                    "blocked_new_entry": True, "reason": "ny_5pm_rollover_blackout",
-                    "newYorkTime": ny_now
-                })
+                return tv_response(
+                    {
+                        "ok": False,
+                        "action": action,
+                        "instrument": instrument,
+                        "blocked_new_entry": True,
+                        "reason": "ny_5pm_rollover_blackout",
+                        "newYorkTime": ny_now,
+                    }
+                )
             with ENTRY_LOCK:
                 spread_guard = enforce_entry_spread_guard(data, instrument)
                 if not spread_guard.get("ok", False):
-                    return tv_response({"ok": False, "action": action, "instrument": instrument, "blocked_new_entry": True, "result": spread_guard})
+                    return tv_response(
+                        {
+                            "ok": False,
+                            "action": action,
+                            "instrument": instrument,
+                            "blocked_new_entry": True,
+                            "result": spread_guard,
+                        }
+                    )
                 units, sizing = choose_units(data, instrument, action)
                 sizing["entrySpreadGuard"] = spread_guard
                 sizing["newYorkTime"] = ny_now
                 status, body = strict_synced_entry(action, instrument, units, sizing, policy=policy)
-                return tv_response({"ok": status < 300 and body.get("ok", False), "action": action, "instrument": instrument, "broker_status": status, "result": body})
+                return tv_response(
+                    {
+                        "ok": status < 300 and body.get("ok", False),
+                        "action": action,
+                        "instrument": instrument,
+                        "broker_status": status,
+                        "result": body,
+                    }
+                )
 
         if action == "flip":
             target = str(data.get("target") or data.get("side") or "").lower().strip()
             rollover_blocked, ny_now = ny_rollover_blocked_now()
             if rollover_blocked:
-                return tv_response({
-                    "ok": False, "action": action, "instrument": instrument, "target": target,
-                    "blocked_new_entry": True, "reason": "ny_5pm_rollover_blackout",
-                    "newYorkTime": ny_now
-                })
+                return tv_response(
+                    {
+                        "ok": False,
+                        "action": action,
+                        "instrument": instrument,
+                        "target": target,
+                        "blocked_new_entry": True,
+                        "reason": "ny_5pm_rollover_blackout",
+                        "newYorkTime": ny_now,
+                    }
+                )
             with ENTRY_LOCK:
                 if target in {"buy", "long"}:
                     entry_payload = {**data, "action": "buy"}
                     spread_guard = enforce_entry_spread_guard(entry_payload, instrument)
                     if not spread_guard.get("ok", False):
-                        return tv_response({"ok": False, "action": action, "instrument": instrument, "target": target, "blocked_new_entry": True, "result": spread_guard})
+                        return tv_response(
+                            {
+                                "ok": False,
+                                "action": action,
+                                "instrument": instrument,
+                                "target": target,
+                                "blocked_new_entry": True,
+                                "result": spread_guard,
+                            }
+                        )
                     units, sizing = choose_units(entry_payload, instrument, "buy")
                     sizing["entrySpreadGuard"] = spread_guard
                     sizing["newYorkTime"] = ny_now
@@ -852,25 +1753,49 @@ def webhook():
                     entry_payload = {**data, "action": "sell"}
                     spread_guard = enforce_entry_spread_guard(entry_payload, instrument)
                     if not spread_guard.get("ok", False):
-                        return tv_response({"ok": False, "action": action, "instrument": instrument, "target": target, "blocked_new_entry": True, "result": spread_guard})
+                        return tv_response(
+                            {
+                                "ok": False,
+                                "action": action,
+                                "instrument": instrument,
+                                "target": target,
+                                "blocked_new_entry": True,
+                                "result": spread_guard,
+                            }
+                        )
                     units, sizing = choose_units(entry_payload, instrument, "sell")
                     sizing["entrySpreadGuard"] = spread_guard
                     sizing["newYorkTime"] = ny_now
                     status, body = strict_synced_entry("sell", instrument, units, sizing, policy="sync")
                 else:
                     return hard_error({"ok": False, "error": "bad_flip_target", "target": target}, 400)
-                return tv_response({"ok": status < 300 and body.get("ok", False), "action": action, "instrument": instrument, "target": target, "broker_status": status, "result": body})
-
+                return tv_response(
+                    {
+                        "ok": status < 300 and body.get("ok", False),
+                        "action": action,
+                        "instrument": instrument,
+                        "target": target,
+                        "broker_status": status,
+                        "result": body,
+                    }
+                )
 
         return hard_error({"ok": False, "error": "unsupported_action", "action": action}, 400)
 
-    except ValueError as e:
-        return hard_error({"ok": False, "error": str(e), "payload": data}, 400)
-    except requests.RequestException as e:
-        return tv_response({"ok": False, "error": "oanda_request_exception", "detail": str(e)}, 200)
-    except Exception as e:
+    except ValueError as exc:
+        return hard_error({"ok": False, "error": str(exc), "payload": data}, 400)
+    except requests.RequestException as exc:
+        return tv_response({"ok": False, "error": "oanda_request_exception", "detail": str(exc)}, 200)
+    except Exception as exc:
         app.logger.exception("Unhandled webhook error")
-        return tv_response({"ok": False, "error": "unhandled_exception", "detail": str(e)}, 200)
+        return tv_response({"ok": False, "error": "unhandled_exception", "detail": str(exc)}, 200)
+
+
+# Initialize schema at import. Failure is logged but remains non-fatal to trading.
+try:
+    init_ledger()
+except Exception as _ledger_init_exc:
+    log_event("TGIM-LEDGER-INIT-NONFATAL-ERROR", {"error": repr(_ledger_init_exc), "path": LEDGER_PATH})
 
 
 if __name__ == "__main__":
