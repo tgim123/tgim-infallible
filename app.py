@@ -1,5 +1,5 @@
 //@version=6
-// © UnApologeticallyDeplorableMe
+// # UnApologeticallyDeplorableMe
 // @strategy_alert_message {{strategy.order.alert_message}}
 //
 // BUILD MARKER: TFSTACK-ADX4-PAIRPROFILES-V6.5.3-FX — FULL LAB + PIPMAN + CMP2 + RENDER WEBHOOK EXECUTION
